@@ -1,0 +1,28 @@
+name: Dev Branch CI
+
+on:
+  push:
+    branches:
+      - {{DEV_BRANCH}}
+  pull_request:
+    branches:
+      - {{MAIN_BRANCH}}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '{{NODE_VERSION}}'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: {{INSTALL_DEPS_COMMAND}}
+
+      - name: Run build
+        run: {{BUILD_COMMAND}}
