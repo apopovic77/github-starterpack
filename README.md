@@ -53,6 +53,23 @@ Quick shortcut: From the repo root you can also use `./devops <command>` (e.g. `
 
 ---
 
+## 🛠️ Command Cheatsheet
+
+Every project gets the raw scripts in `.devops/scripts/` *and* a convenience dispatcher `./devops` at the repo root. Both call the same logic – use whichever you prefer.
+
+| Wrapper command | Underlying script | Purpose |
+|-----------------|------------------|---------|
+| `./devops checkout <branch>` | `.devops/scripts/checkout-branch.sh` | Cleanly switch to `dev`/`main` (fetch + fast-forward) |
+| `./devops push "msg"` | `.devops/scripts/push-dev.sh` | Stage → commit → push to the integration branch |
+| `./devops build [--clean]` | `.devops/scripts/build-local.sh` | Run the production build locally |
+| `./devops release [--no-build]` | `.devops/scripts/release.sh` | Promote `dev` → `main` and trigger the GitHub Actions deploy |
+| `./devops update [options]` | `.devops/scripts/update-devops.sh` | Pull the latest starter-pack templates and reapply (`--starter-path` if needed) |
+| `./devops rollback` | `.devops/rollback.sh` | Restore a previous backup on the server |
+
+All commands require a clean working tree unless they explicitly create commits (`push`). If you forget the syntax, run `./devops help`.
+
+---
+
 ## ♻️ Updating Existing Projects
 
 When the starter pack evolves, refresh an existing project in-place:
