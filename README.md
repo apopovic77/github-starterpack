@@ -51,6 +51,22 @@ All files are plain Bash/Markdown/Node workflows so they can be adapted for othe
 
 ---
 
+## ♻️ Updating Existing Projects
+
+When the starter pack evolves, refresh an existing project in-place:
+
+```bash
+# In this repo (to pull the latest templates)
+git pull
+
+# Reapply templates with the saved configuration
+scripts/setup-devops.sh --target /path/to/project --update
+```
+
+The installer reads `.devops/starter-config.json` (created on the first run), reapplies the templates, and keeps your previous answers. Review the diff, reconcile any local customisations, run a test release, then commit the update.
+
+---
+
 ## 🧠 AI Agent Playbook
 
 When an AI agent is asked to operate a project prepared with this starter pack, follow this script:

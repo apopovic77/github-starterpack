@@ -40,6 +40,7 @@ Options:
   --web-group <group>    Web server group for chown (default www-data)
   --backup-prefix <str>  Prefix for backups (default derived from project slug)
   --non-interactive      Fail if required values missing instead of prompting
+  --update               Re-apply templates using stored configuration
   -h, --help             Show this help message
 USAGE
 }
@@ -58,6 +59,7 @@ WEB_USER="www-data"
 WEB_GROUP="www-data"
 BACKUP_PREFIX=""
 NON_INTERACTIVE=false
+UPDATE=false
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -118,6 +120,10 @@ while [[ $# -gt 0 ]]; do
       NON_INTERACTIVE=true
       shift
       ;;
+    --update)
+      UPDATE=true
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -142,6 +148,30 @@ if [[ ! -d "$TARGET" ]]; then
 fi
 
 TARGET="$(cd "$TARGET" && pwd)"
+CONFIG_PATH="$TARGET/.devops/starter-config.json"
+
+if [[ "$UPDATE" == true ]]; then
+  if [[ ! -f "$CONFIG_PATH" ]]; then
+    echo "Error: --update requires existing configuration at $CONFIG_PATH" >&2
+    exit 1
+  fi
+  tmpfile=$(mktemp)
+  python3 - "$CONFIG_PATH" "$tmpfile" <<'PY'
+import json, shlex, sys
+cfg_path, out_path = sys.argv[1], sys.argv[2]
+data = json.load(open(cfg_path))
+with open(out_path, "w") as fh:
+    for key, value in data.items():
+        if isinstance(value, bool):
+            value = "true" if value else "false"
+        fh.write(f'if [[ -z "${{{key}}}" ]]; then {key}={shlex.quote(str(value))}; fi\n')
+PY
+  # shellcheck disable=SC1090
+  source "$tmpfile"
+  rm -f "$tmpfile"
+  NON_INTERACTIVE=true
+fi
+
 default PROJECT_NAME "$(basename "$TARGET")"
 default REPO_ROOT "$TARGET"
 PROJECT_SLUG="$(slugify "$PROJECT_NAME")"
@@ -220,6 +250,15 @@ for file_path in sys.argv[2:]:
 PY
 
 find "$TARGET/.devops" -type f -name '*.sh' -exec chmod +x {} +
+
+mkdir -p "$(dirname "$CONFIG_PATH")"
+python3 - "$CONFIG_PATH" <<'PY'
+import json, os, sys
+config_path = sys.argv[1]
+data = json.loads(os.environ["PLACEHOLDERS_JSON"])
+with open(config_path, "w") as fh:
+    json.dump(data, fh, indent=2, sort_keys=True)
+PY
 
 cat <<EOF
 ✅ DevOps templates installed into $TARGET
