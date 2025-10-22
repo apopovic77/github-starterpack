@@ -9,6 +9,7 @@
    - `push-dev.sh "commit message"` – checkout {{DEV_BRANCH}} → fast-forward from origin → stage all → commit → push `origin {{DEV_BRANCH}}`.
    - `build-local.sh [--clean]` – optional clean dist, run `{{BUILD_COMMAND}}`.
    - `release.sh [--no-build]` – sync & push {{DEV_BRANCH}}, optional local build, fast-forward {{MAIN_BRANCH}} from {{DEV_BRANCH}}, push {{MAIN_BRANCH}}, switch back to {{DEV_BRANCH}} (triggers GitHub Actions deploy).
+   - `update-devops.sh [--starter-path <path>]` – optionally fetches `starter-devops` and re-applies the starter templates with `--update` using `.devops/starter-config.json`.
 
 3. **Deployment pipeline**
    - GitHub Actions workflows are in `.github/workflows/`.
