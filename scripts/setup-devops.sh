@@ -165,7 +165,7 @@ with open(out_path, "w") as fh:
     for key, value in data.items():
         if isinstance(value, bool):
             value = "true" if value else "false"
-        fh.write(f'if [[ -z "${{{key}}}" ]]; then {key}={shlex.quote(str(value))}; fi\n')
+        fh.write(f'if [[ -z "${{{key}:-}}" ]]; then {key}={shlex.quote(str(value))}; fi\n')
 PY
   # shellcheck disable=SC1090
   source "$tmpfile"
