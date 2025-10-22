@@ -11,6 +11,8 @@
    - `release.sh [--no-build]` – sync & push {{DEV_BRANCH}}, optional local build, fast-forward {{MAIN_BRANCH}} from {{DEV_BRANCH}}, push {{MAIN_BRANCH}}, switch back to {{DEV_BRANCH}} (triggers GitHub Actions deploy).
    - `update-devops.sh [--starter-path <path>]` – optionally fetches `starter-devops` and re-applies the starter templates with `--update` using `.devops/starter-config.json`.
 
+   Shortcuts: the repository root includes a dispatcher `./devops` so you can run `./devops checkout {{DEV_BRANCH}}`, `./devops push "msg"`, `./devops release`, or `./devops update` without remembering the full paths.
+
 3. **Deployment pipeline**
    - GitHub Actions workflows are in `.github/workflows/`.
    - `dev.yml` runs on pushes to `{{DEV_BRANCH}}` or PRs targeting `{{MAIN_BRANCH}}`; it builds but does *not* deploy.

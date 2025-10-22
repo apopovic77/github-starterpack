@@ -211,6 +211,9 @@ mkdir -p "$TARGET/.devops" "$TARGET/.github/workflows"
 
 tar -C "$TEMPLATE_ROOT/devops" -cf - . | tar -C "$TARGET/.devops" -xf -
 tar -C "$TEMPLATE_ROOT/github/workflows" -cf - . | tar -C "$TARGET/.github/workflows" -xf -
+if [[ -d "$TEMPLATE_ROOT/root" ]]; then
+  tar -C "$TEMPLATE_ROOT/root" -cf - . | tar -C "$TARGET" -xf -
+fi
 
 mapfile -t FILES < <(find "$TARGET/.devops" "$TARGET/.github/workflows" -type f)
 
@@ -257,6 +260,9 @@ for file_path in sys.argv[2:]:
 PY
 
 find "$TARGET/.devops" -type f -name '*.sh' -exec chmod +x {} +
+if [[ -f "$TARGET/devops" ]]; then
+  chmod +x "$TARGET/devops"
+fi
 
 mkdir -p "$(dirname "$CONFIG_PATH")"
 python3 - "$CONFIG_PATH" <<'PY'

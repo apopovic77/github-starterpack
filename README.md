@@ -49,6 +49,8 @@ All files are plain Bash/Markdown/Node workflows so they can be adapted for othe
 7. Push to your development branch and let `dev.yml` verify the build.
 8. When ready, run `.devops/scripts/release.sh` to promote to production and trigger the deploy workflow.
 
+Quick shortcut: From the repo root you can also use `./devops <command>` (e.g. `./devops push "msg"`, `./devops release`, `./devops update`).
+
 ---
 
 ## ♻️ Updating Existing Projects

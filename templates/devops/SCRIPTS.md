@@ -9,3 +9,12 @@ The following helper scripts live in `.devops/scripts/` and automate the local r
 - `update-devops.sh [--starter-path <path>]` – Optionally fetches `starter-devops` and reruns the starter templates with `--update` so `.devops/` and `.github/workflows/` stay current.
 
 After copying the scripts into a project run `chmod +x .devops/scripts/*.sh` if your Git checkout does not preserve executable bits.
+
+Shortcuts: the repository root includes a `./devops` helper. Example calls:
+
+```bash
+./devops checkout {{DEV_BRANCH}}
+./devops push "feat: add new helmet grid"
+./devops release
+./devops update
+```
