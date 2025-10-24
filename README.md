@@ -1,6 +1,10 @@
 # DevOps Starter Pack
 
-Production-ready scripts, docs, and GitHub Actions workflows that turn any React/Vite (or similar Node-based) project into a CI/CD-enabled app with SSH deployments. Designed so humans and AI agents can install and operate the release process with predictable steps.
+Production-ready scripts, docs, and GitHub Actions workflows that turn any **Node.js or PHP** project into a CI/CD-enabled app with SSH deployments. Designed so humans and AI agents can install and operate the release process with predictable steps.
+
+**Supported Project Types:**
+- ✅ Node.js (React, Vue, Vite, Next.js, etc.)
+- ✅ PHP (plain PHP, Laravel, WordPress, Symfony, etc.)
 
 ---
 
@@ -17,14 +21,38 @@ All files are plain Bash/Markdown/Node workflows so they can be adapted for othe
 
 ## ✅ Requirements
 
-- Git, Node.js, npm (or compatible package manager) available in the target project.
-- GitHub CLI (`gh`) authenticated if you want to push directly after installation.
-- SSH access to the deployment server (public key must be added to `authorized_keys`).
+**For Node.js projects:**
+- Git, Node.js, npm (or compatible package manager)
+
+**For PHP projects:**
+- Git, PHP (8.0+), optionally Composer
+
+**For all projects:**
+- GitHub CLI (`gh`) authenticated if you want to push directly after installation
+- SSH access to the deployment server (public key must be added to `authorized_keys`)
 - GitHub repository secrets for deployment:
   - `DEPLOY_HOST`
   - `DEPLOY_USER`
   - `DEPLOY_SSH_KEY` (private key corresponding to the authorized public key)
   - `DEPLOY_PORT` *(optional, default 22)*
+
+## 🔍 Auto-Detection
+
+The installer automatically detects your project type:
+
+**PHP Detection:**
+- Looks for `composer.json` or `*.php` files
+- Sets build command to "no build needed"
+- Uses PHP-optimized GitHub Actions workflows
+- Direct rsync deployment (no npm build step)
+
+**Node.js Detection:**
+- Looks for `package.json`
+- Configures npm/yarn build pipeline
+- Uses Node.js GitHub Actions workflows
+- Builds and deploys `dist/` folder
+
+You can override auto-detection with `--build-command` and `--install-deps` flags.
 
 ---
 
@@ -50,6 +78,24 @@ All files are plain Bash/Markdown/Node workflows so they can be adapted for othe
 8. When ready, run `.devops/scripts/release.sh` to promote to production and trigger the deploy workflow.
 
 Quick shortcut: From the repo root you can also use `./devops <command>` (e.g. `./devops push "msg"`, `./devops release`, `./devops update`).
+
+### 📝 Example: PHP Project
+
+For a PHP admin panel (like WordPress, Laravel, or plain PHP):
+
+```bash
+/var/code/github-starterpack/scripts/setup-devops.sh \
+  --target /var/www/admin.example.com \
+  --project-name "Admin Panel" \
+  --site-url https://admin.example.com \
+  --deploy-path /var/www/admin.example.com
+```
+
+**What happens:**
+- ✅ Auto-detects PHP files
+- ✅ Sets `BUILD_COMMAND="echo '✅ No build needed for PHP application'"`
+- ✅ Uses PHP-optimized GitHub Actions (syntax check, rsync deploy)
+- ✅ No npm/Node.js requirements
 
 ---
 
@@ -168,11 +214,20 @@ Upload the private key as the secret, append the `.pub` file to `authorized_keys
 
 ## ❓ Troubleshooting
 
-- **SSH authentication fails in deploy workflow** – double-check `DEPLOY_SSH_KEY` matches the server’s `authorized_keys`, and that `DEPLOY_USER` has permission to access the repo + deploy path.
+### General Issues
+
+- **SSH authentication fails in deploy workflow** – double-check `DEPLOY_SSH_KEY` matches the server's `authorized_keys`, and that `DEPLOY_USER` has permission to access the repo + deploy path.
 - **Release script refuses to run** – ensure `git status` is clean; scripts abort when uncommitted changes exist.
 - **Workflows not triggering** – confirm the production branch and development branch names in the workflow files match your repository.
 - **File permissions wrong on server** – adjust `--web-user` / `--web-group` to match your environment (e.g., `nginx`, `apache`).
 - **Need to regenerate templates** – rerun the installer with the same target to overwrite (or delete `.devops/` and `.github/workflows/` first).
+
+### PHP-Specific Issues
+
+- **"npm: command not found" error** – you have Node.js templates on a PHP project. Run `--update` to regenerate with PHP auto-detection, or manually edit `.github/workflows/deploy.yml` to remove Node.js steps.
+- **PHP syntax errors in CI** – the dev workflow runs `php -l` on all `.php` files. Fix syntax errors before pushing.
+- **Composer dependencies** – if you need `composer install`, override with `--install-deps "composer install --no-dev"` during setup.
+- **Wrong project type detected** – force the correct build command with `--build-command "your command"` flag during installation.
 
 ---
 

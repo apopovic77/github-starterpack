@@ -1,0 +1,48 @@
+name: Dev Branch CI
+
+on:
+  push:
+    branches:
+      - {{DEV_BRANCH}}
+  pull_request:
+    branches:
+      - {{MAIN_BRANCH}}
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          tools: composer
+
+      - name: Verify PHP syntax
+        run: |
+          echo "🔍 Checking PHP syntax for all files..."
+          find . -name "*.php" -not -path "./vendor/*" -not -path "./node_modules/*" | while read file; do
+            php -l "$file" || exit 1
+          done
+          echo "✅ PHP syntax check passed"
+
+      - name: List PHP files
+        run: |
+          echo "📁 PHP files in project:"
+          find . -name "*.php" -not -path "./vendor/*" -not -path "./node_modules/*" | head -20
+
+      - name: Check composer.json (if exists)
+        run: |
+          if [ -f "composer.json" ]; then
+            echo "📦 Found composer.json"
+            cat composer.json | head -20
+          else
+            echo "ℹ️  No composer.json found (plain PHP project)"
+          fi
+
+      - name: Validate success
+        run: echo "✅ All validation checks passed!"
+

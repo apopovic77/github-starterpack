@@ -151,6 +151,25 @@ fi
 TARGET="$(cd "$TARGET" && pwd)"
 CONFIG_PATH="$TARGET/.devops/starter-config.json"
 
+# Auto-detect project type
+PROJECT_TYPE=""
+if [[ -f "$TARGET/composer.json" ]] || ls "$TARGET"/*.php &>/dev/null; then
+  PROJECT_TYPE="php"
+  echo "📦 Detected: PHP project"
+  if [[ "$UPDATE" == false ]]; then
+    # Only override defaults on fresh install, not update
+    INSTALL_DEPS_COMMAND="echo '✅ PHP project - no npm dependencies'"
+    BUILD_COMMAND="echo '✅ No build needed for PHP application'"
+    NODE_VERSION="n/a"
+  fi
+elif [[ -f "$TARGET/package.json" ]]; then
+  PROJECT_TYPE="node"
+  echo "📦 Detected: Node.js project"
+else
+  echo "⚠️  Could not auto-detect project type. Assuming Node.js defaults."
+  PROJECT_TYPE="node"
+fi
+
 if [[ "$UPDATE" == true ]]; then
   if [[ ! -f "$CONFIG_PATH" ]]; then
     echo "Error: --update requires existing configuration at $CONFIG_PATH" >&2
@@ -210,20 +229,29 @@ done
 mkdir -p "$TARGET/.devops" "$TARGET/.github/workflows"
 
 tar -C "$TEMPLATE_ROOT/devops" -cf - . | tar -C "$TARGET/.devops" -xf -
-tar -C "$TEMPLATE_ROOT/github/workflows" -cf - . | tar -C "$TARGET/.github/workflows" -xf -
+
+# Use PHP-specific templates if detected
+if [[ "$PROJECT_TYPE" == "php" ]] && [[ -d "$TEMPLATE_ROOT/github-php/workflows" ]]; then
+  echo "📦 Using PHP-optimized GitHub Actions workflows"
+  tar -C "$TEMPLATE_ROOT/github-php/workflows" -cf - . | tar -C "$TARGET/.github/workflows" -xf -
+else
+  tar -C "$TEMPLATE_ROOT/github/workflows" -cf - . | tar -C "$TARGET/.github/workflows" -xf -
+fi
+
 if [[ -d "$TEMPLATE_ROOT/root" ]]; then
   tar -C "$TEMPLATE_ROOT/root" -cf - . | tar -C "$TARGET" -xf -
 fi
 
 mapfile -t FILES < <(find "$TARGET/.devops" "$TARGET/.github/workflows" -type f)
 
-export PROJECT_NAME PROJECT_SLUG REPO_ROOT DEPLOY_PATH SITE_URL DEV_BRANCH MAIN_BRANCH INSTALL_DEPS_COMMAND BUILD_COMMAND NODE_VERSION WEB_USER WEB_GROUP BACKUP_PREFIX STARTER_PATH
+export PROJECT_NAME PROJECT_SLUG PROJECT_TYPE REPO_ROOT DEPLOY_PATH SITE_URL DEV_BRANCH MAIN_BRANCH INSTALL_DEPS_COMMAND BUILD_COMMAND NODE_VERSION WEB_USER WEB_GROUP BACKUP_PREFIX STARTER_PATH
 
 PLACEHOLDERS_JSON=$(python3 - <<'PY'
 import json, os
 print(json.dumps({
   "PROJECT_NAME": os.environ["PROJECT_NAME"],
   "PROJECT_SLUG": os.environ["PROJECT_SLUG"],
+  "PROJECT_TYPE": os.environ.get("PROJECT_TYPE", "node"),
   "REPO_ROOT": os.environ["REPO_ROOT"],
   "DEPLOY_PATH": os.environ["DEPLOY_PATH"],
   "SITE_URL": os.environ["SITE_URL"],
@@ -240,7 +268,7 @@ print(json.dumps({
 PY
 )
 
-export PLACEHOLDERS_JSON PROJECT_NAME PROJECT_SLUG REPO_ROOT DEPLOY_PATH SITE_URL DEV_BRANCH MAIN_BRANCH INSTALL_DEPS_COMMAND BUILD_COMMAND NODE_VERSION WEB_USER WEB_GROUP BACKUP_PREFIX STARTER_PATH
+export PLACEHOLDERS_JSON PROJECT_NAME PROJECT_SLUG PROJECT_TYPE REPO_ROOT DEPLOY_PATH SITE_URL DEV_BRANCH MAIN_BRANCH INSTALL_DEPS_COMMAND BUILD_COMMAND NODE_VERSION WEB_USER WEB_GROUP BACKUP_PREFIX STARTER_PATH
 
 python3 - "$PLACEHOLDERS_JSON" "${FILES[@]}" <<'PY'
 import json
