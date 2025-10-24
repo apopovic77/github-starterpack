@@ -210,6 +210,17 @@ Upload the private key as the secret, append the `.pub` file to `authorized_keys
 - Additional workflows: add more templates under `templates/github/workflows/` and re-run the installer (or copy manually).
 - Branch naming: the scripts hardcode the names you provide; ensure GitHub branch protection settings match.
 
+### 🔒 Example: Arkturian Transcoding API via Relay Host
+
+Some environments can only be reached from an internal relay. For the transcoding API, deployments flow from GitHub → self-hosted runner on `arkturian.com` → targets behind reverse tunnels:
+
+- Runner directory: `/var/code/actions-runner-transcoding`, service `actions.runner.apopovic77-transcoding_api.arkturian-transcoding.service`.
+- Workflow labels: `self-hosted`, `arkturian`, `transcoding` pin the deploy job to that host.
+- Reverse tunnels expose `arkserver` (Debian) at `localhost:2223` and the Mac at `localhost:2222` on `arkturian.com`.
+- Deploy steps rsync the repo to `/var/code/transcoding_api/` and `/Users/alex/mac_transcoding_api/`, then call `bash ./restart_server.sh` (script bootstraps a venv & installs `requirements.txt` if missing).
+
+💡 Tip: Reuse the same runner and labels for any project that must hop through the tunnels; GitHub-hosted runners cannot reach those ports directly.
+
 ---
 
 ## ❓ Troubleshooting
