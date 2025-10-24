@@ -5,6 +5,7 @@ Production-ready scripts, docs, and GitHub Actions workflows that turn any **Nod
 **Supported Project Types:**
 - ✅ Node.js (React, Vue, Vite, Next.js, etc.)
 - ✅ PHP (plain PHP, Laravel, WordPress, Symfony, etc.)
+- ✅ Playwright Tests (E2E testing with Playwright)
 
 ---
 
@@ -39,6 +40,12 @@ All files are plain Bash/Markdown/Node workflows so they can be adapted for othe
 ## 🔍 Auto-Detection
 
 The installer automatically detects your project type:
+
+**Playwright Test Detection:**
+- Looks for `playwright.config.ts` or `playwright.config.js`
+- Configures test-specific workflows (scheduled tests, post-deployment tests)
+- Sets build command to "npm test"
+- No traditional deployment (tests run in GitHub Actions)
 
 **PHP Detection:**
 - Looks for `composer.json` or `*.php` files
@@ -96,6 +103,26 @@ For a PHP admin panel (like WordPress, Laravel, or plain PHP):
 - ✅ Sets `BUILD_COMMAND="echo '✅ No build needed for PHP application'"`
 - ✅ Uses PHP-optimized GitHub Actions (syntax check, rsync deploy)
 - ✅ No npm/Node.js requirements
+
+### 📝 Example: Playwright Test Project
+
+For a Playwright E2E test suite:
+
+```bash
+/var/code/github-starterpack/scripts/setup-devops.sh \
+  --target /var/code/api-e2e-tests \
+  --project-name "API E2E Tests" \
+  --site-url https://api.example.com
+```
+
+**What happens:**
+- ✅ Auto-detects `playwright.config.ts`
+- ✅ Sets `BUILD_COMMAND="npm test"`
+- ✅ Uses test-optimized GitHub Actions workflows:
+  - Scheduled tests (daily at 2 AM UTC)
+  - Post-deployment tests (triggered by `repository_dispatch`)
+  - Manual specific API tests
+- ✅ No traditional deployment (tests run in CI only)
 
 ---
 

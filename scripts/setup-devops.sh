@@ -153,7 +153,16 @@ CONFIG_PATH="$TARGET/.devops/starter-config.json"
 
 # Auto-detect project type
 PROJECT_TYPE=""
-if [[ -f "$TARGET/composer.json" ]] || ls "$TARGET"/*.php &>/dev/null; then
+if [[ -f "$TARGET/playwright.config.ts" ]] || [[ -f "$TARGET/playwright.config.js" ]]; then
+  PROJECT_TYPE="test"
+  echo "📦 Detected: Playwright test project"
+  if [[ "$UPDATE" == false ]]; then
+    # Only override defaults on fresh install, not update
+    INSTALL_DEPS_COMMAND="npm ci"
+    BUILD_COMMAND="npm test"
+    NODE_VERSION="18"
+  fi
+elif [[ -f "$TARGET/composer.json" ]] || ls "$TARGET"/*.php &>/dev/null; then
   PROJECT_TYPE="php"
   echo "📦 Detected: PHP project"
   if [[ "$UPDATE" == false ]]; then
@@ -230,8 +239,11 @@ mkdir -p "$TARGET/.devops" "$TARGET/.github/workflows"
 
 tar -C "$TEMPLATE_ROOT/devops" -cf - . | tar -C "$TARGET/.devops" -xf -
 
-# Use PHP-specific templates if detected
-if [[ "$PROJECT_TYPE" == "php" ]] && [[ -d "$TEMPLATE_ROOT/github-php/workflows" ]]; then
+# Use project-type-specific templates if detected
+if [[ "$PROJECT_TYPE" == "test" ]] && [[ -d "$TEMPLATE_ROOT/github-test/workflows" ]]; then
+  echo "📦 Using Playwright test-optimized GitHub Actions workflows"
+  tar -C "$TEMPLATE_ROOT/github-test/workflows" -cf - . | tar -C "$TARGET/.github/workflows" -xf -
+elif [[ "$PROJECT_TYPE" == "php" ]] && [[ -d "$TEMPLATE_ROOT/github-php/workflows" ]]; then
   echo "📦 Using PHP-optimized GitHub Actions workflows"
   tar -C "$TEMPLATE_ROOT/github-php/workflows" -cf - . | tar -C "$TARGET/.github/workflows" -xf -
 else
