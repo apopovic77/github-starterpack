@@ -143,6 +143,29 @@ See `devops-tools/README.md` for full documentation.
 
 ---
 
+## 🧑‍🤝‍🧑 Customer Project Bootstrap (arkturian.com)
+
+Use `scripts/setup-customer-project.sh` to spin up a full customer project (GitHub repo, CodePilot DB, Nginx/SSL, build + deploy) based on the shared template that already lives on the server.
+
+Local execution on the server:
+```bash
+./scripts/setup-customer-project.sh --project-name demo1 --customer-email info@demo1.com --customer-name "Demo One"
+```
+
+Remote from your Mac (executes over SSH on arkturian.com):
+```bash
+./scripts/setup-customer-project.sh \
+  --project-name demo1 \
+  --customer-email info@demo1.com \
+  --customer-name "Demo One" \
+  --host arkturian.com \
+  --ssh-user root
+```
+
+Defaults: repo owner `apopovic77`, domain suffix `arkturian.com`, projects root `/var/code`, deploy base `/var/www`, CodePilot DB `codepilot` on `localhost`. Flags let you override these, skip certbot, or choose public repo visibility. The script validates prerequisites (`gh`, `psql`, `nginx`, `certbot`, `npm`, etc.) before making changes.
+
+---
+
 ## 🛠️ Command Cheatsheet
 
 Every project gets the raw scripts in `.devops/scripts/` *and* a convenience dispatcher `./devops` at the repo root. Both call the same logic – use whichever you prefer.
