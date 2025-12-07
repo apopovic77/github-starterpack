@@ -164,6 +164,10 @@ Remote from your Mac (executes over SSH on arkturian.com):
 
 Defaults: repo owner `apopovic77`, domain suffix `arkturian.com`, projects root `/var/code`, deploy base `/var/www`, CodePilot DB `codepilot` on `localhost`. Flags let you override these, skip certbot, or choose public repo visibility. The script validates prerequisites (`gh`, `psql`, `nginx`, `certbot`, `npm`, etc.) before making changes.
 
+Notes:
+- Use `--repo-name` if the GitHub repo should differ from the domain prefix.
+- Use `--domain` to set a custom FQDN (otherwise `<project-name>.<domain-suffix>`).
+
 ---
 
 ## 🛠️ Command Cheatsheet

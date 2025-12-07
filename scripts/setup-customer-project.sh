@@ -22,6 +22,7 @@ Options:
   --customer-email <email>      Optional customer login email (creates/updates user)
   --customer-name <name>        Display name for the customer (default: project name)
   --repo-owner <owner>          GitHub org/user for the repo (default: apopovic77)
+  --domain <fqdn>               Override full domain (default: <project>.<suffix>)
   --domain-suffix <suffix>      Domain suffix (default: arkturian.com)
   --projects-root <path>        Base path to create project locally (default: /var/code)
   --deploy-base <path>          Base path for deployed site (default: /var/www)
@@ -32,6 +33,7 @@ Options:
   --db-password <pw>            Postgres password (default: codepilot)
   --admin-user-id <id>          CodePilot user id to set as project owner (default: 4)
   --token-source-project-id <id>Project id to reuse encrypted GitHub token from (default: 10)
+  --repo-name <name>            Override GitHub repo name (default: project name)
   --ssh-user <user>             SSH user when --host is set (default: root)
   --host <hostname>             If set, re-executes this script on the remote host via SSH
   --skip-certbot                Do not request an SSL certificate
@@ -49,6 +51,8 @@ DOMAIN_SUFFIX="arkturian.com"
 PROJECTS_ROOT="/var/code"
 DEPLOY_BASE="/var/www"
 TEMPLATE_DIR="/var/code/customer-template"
+DOMAIN_OVERRIDE=""
+REPO_NAME_OVERRIDE=""
 DB_HOST="localhost"
 DB_NAME="codepilot"
 DB_USER="codepilot"
@@ -81,6 +85,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --domain-suffix)
       DOMAIN_SUFFIX="${2:-}"
+      shift 2
+      ;;
+    --domain)
+      DOMAIN_OVERRIDE="${2:-}"
       shift 2
       ;;
     --projects-root)
@@ -117,6 +125,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --token-source-project-id)
       TOKEN_SOURCE_PROJECT_ID="${2:-}"
+      shift 2
+      ;;
+    --repo-name)
+      REPO_NAME_OVERRIDE="${2:-}"
       shift 2
       ;;
     --ssh-user)
@@ -166,10 +178,11 @@ if [[ -n "$SSH_HOST" && "${RUN_REMOTE:-0}" != "1" ]]; then
 fi
 
 CUSTOMER_NAME="${CUSTOMER_NAME:-$PROJECT_NAME}"
-DOMAIN="${PROJECT_NAME}.${DOMAIN_SUFFIX}"
+DOMAIN="${DOMAIN_OVERRIDE:-${PROJECT_NAME}.${DOMAIN_SUFFIX}}"
 PROJECT_DIR="${PROJECTS_ROOT%/}/${PROJECT_NAME}"
 DEPLOY_PATH="${DEPLOY_BASE%/}/${DOMAIN}"
-GITHUB_REPO="${REPO_OWNER}/${PROJECT_NAME}"
+REPO_NAME="${REPO_NAME_OVERRIDE:-$PROJECT_NAME}"
+GITHUB_REPO="${REPO_OWNER}/${REPO_NAME}"
 
 require_cmd() {
   local cmd="$1"
