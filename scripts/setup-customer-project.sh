@@ -38,6 +38,7 @@ Options:
   --host <hostname>             If set, re-executes this script on the remote host via SSH
   --skip-certbot                Do not request an SSL certificate
   --public                      Create GitHub repo as public (default: private)
+  --npm-add "<pkg>[,...]"       Extra npm packages to install (no-save) after npm ci (e.g., "@scope/pkg@1.2.3,react-asset-preloader")
   --yes                         Skip confirmation prompt
   -h, --help                    Show this help
 USAGE
@@ -64,6 +65,7 @@ SSH_USER="root"
 SKIP_CERTBOT=false
 GH_VISIBILITY="private"
 ASSUME_YES=false
+NPM_EXTRA_PACKAGES=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -147,6 +149,13 @@ while [[ $# -gt 0 ]]; do
       GH_VISIBILITY="public"
       shift
       ;;
+    --npm-add)
+      IFS=',' read -ra extra <<< "${2:-}"
+      for p in "${extra[@]}"; do
+        [[ -n "$p" ]] && NPM_EXTRA_PACKAGES+=("$p")
+      done
+      shift 2
+      ;;
     --yes)
       ASSUME_YES=true
       shift
@@ -219,6 +228,9 @@ echo "  GitHub:         $GITHUB_REPO (${GH_VISIBILITY})"
 echo "  DB:             ${DB_USER}@${DB_HOST}/${DB_NAME}"
 if [[ -n "$CUSTOMER_EMAIL" ]]; then
   echo "  Customer user:  ${CUSTOMER_EMAIL} (${CUSTOMER_NAME})"
+fi
+if [[ ${#NPM_EXTRA_PACKAGES[@]} -gt 0 ]]; then
+  echo "  NPM add-ons:    ${NPM_EXTRA_PACKAGES[*]}"
 fi
 
 if ! confirm; then
@@ -401,6 +413,11 @@ if [[ -n "$npm_token_env" ]]; then
 fi
 npm ci --silent --userconfig "$tmp_npmrc"
 npm_exit=$?
+if [[ $npm_exit -eq 0 && ${#NPM_EXTRA_PACKAGES[@]} -gt 0 ]]; then
+  log "Installing extra packages: ${NPM_EXTRA_PACKAGES[*]}"
+  npm install --silent --no-save --userconfig "$tmp_npmrc" "${NPM_EXTRA_PACKAGES[@]}"
+  npm_exit=$?
+fi
 rm -f "$tmp_npmrc"
 if [[ $npm_exit -ne 0 ]]; then
   exit $npm_exit
