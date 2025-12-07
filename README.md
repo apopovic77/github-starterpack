@@ -168,6 +168,16 @@ Notes:
 - Use `--repo-name` if the GitHub repo should differ from the domain prefix.
 - Use `--domain` to set a custom FQDN (otherwise `<project-name>.<domain-suffix>`).
 
+Cleanup helper:
+```bash
+./scripts/delete-customer-project.sh \
+  --project-name demo1 \
+  --repo-name demo1 \
+  --domain demo1.arkturian.com \
+  --yes
+```
+Deletes GitHub repo, CodePilot DB records, Nginx vhost, deploy path, and local project.
+
 ---
 
 ## 🛠️ Command Cheatsheet
