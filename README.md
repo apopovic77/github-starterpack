@@ -126,6 +126,23 @@ For a Playwright E2E test suite:
 
 ---
 
+## 🧰 DevOps Tools
+
+The `devops-tools/` directory contains cross-project utilities for managing and monitoring all repositories:
+
+- **`check-devops-repos.sh`** - Scans all repositories for .devops implementation status
+- **`health-check-all.sh`** - Health checks for all deployed servers
+- **`sync-devops-config.sh`** - Syncs .devops configs across all repositories
+
+Run from the starterpack root:
+```bash
+./devops-tools/scripts/check-devops-repos.sh
+```
+
+See `devops-tools/README.md` for full documentation.
+
+---
+
 ## 🛠️ Command Cheatsheet
 
 Every project gets the raw scripts in `.devops/scripts/` *and* a convenience dispatcher `./devops` at the repo root. Both call the same logic – use whichever you prefer.

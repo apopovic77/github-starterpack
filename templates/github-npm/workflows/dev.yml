@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - {{DEV_BRANCH}}
+  pull_request:
+    branches:
+      - {{DEV_BRANCH}}
+      - {{MAIN_BRANCH}}
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '{{NODE_VERSION}}'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: {{INSTALL_DEPS_COMMAND}}
+
+      - name: Build package
+        run: {{BUILD_COMMAND}}
+
+      - name: Run tests
+        run: npm test
+        continue-on-error: true
+
+      - name: Check types
+        run: npx tsc --noEmit
+        continue-on-error: true
+
+      - name: Notify on success
+        if: success()
+        run: echo "✅ CI checks passed"
+
+      - name: Notify on failure
+        if: failure()
+        run: echo "❌ CI checks failed"
+

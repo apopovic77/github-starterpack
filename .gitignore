@@ -1,0 +1,17 @@
+# System
+.DS_Store
+*.log
+
+# Dependencies
+node_modules/
+vendor/
+
+# Build artifacts
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+
+# Local overrides
+.env
+dev.env

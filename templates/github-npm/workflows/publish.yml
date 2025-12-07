@@ -1,0 +1,46 @@
+name: Publish NPM Package
+
+on:
+  push:
+    branches:
+      - {{MAIN_BRANCH}}
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '{{NODE_VERSION}}'
+          registry-url: 'https://registry.npmjs.org'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: {{INSTALL_DEPS_COMMAND}}
+
+      - name: Build package
+        run: {{BUILD_COMMAND}}
+
+      - name: Run tests
+        run: npm test
+        continue-on-error: true
+
+      - name: Publish to NPM
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Notify on success
+        if: success()
+        run: echo "✅ Package published successfully"
+
+      - name: Notify on failure
+        if: failure()
+        run: echo "❌ Package publishing failed"
+

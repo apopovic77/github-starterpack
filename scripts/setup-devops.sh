@@ -172,8 +172,19 @@ elif [[ -f "$TARGET/composer.json" ]] || ls "$TARGET"/*.php &>/dev/null; then
     NODE_VERSION="n/a"
   fi
 elif [[ -f "$TARGET/package.json" ]]; then
-  PROJECT_TYPE="node"
-  echo "📦 Detected: Node.js project"
+  # Check if it's an NPM package (has "main" or "types" in package.json)
+  if grep -q '"main"\|"types"\|"exports"' "$TARGET/package.json" 2>/dev/null; then
+    PROJECT_TYPE="npm"
+    echo "📦 Detected: NPM package project"
+    if [[ "$UPDATE" == false ]]; then
+      INSTALL_DEPS_COMMAND="npm ci"
+      BUILD_COMMAND="npm run build"
+      NODE_VERSION="20"
+    fi
+  else
+    PROJECT_TYPE="node"
+    echo "📦 Detected: Node.js application"
+  fi
 else
   echo "⚠️  Could not auto-detect project type. Assuming Node.js defaults."
   PROJECT_TYPE="node"
@@ -246,6 +257,13 @@ if [[ "$PROJECT_TYPE" == "test" ]] && [[ -d "$TEMPLATE_ROOT/github-test/workflow
 elif [[ "$PROJECT_TYPE" == "php" ]] && [[ -d "$TEMPLATE_ROOT/github-php/workflows" ]]; then
   echo "📦 Using PHP-optimized GitHub Actions workflows"
   tar -C "$TEMPLATE_ROOT/github-php/workflows" -cf - . | tar -C "$TARGET/.github/workflows" -xf -
+elif [[ "$PROJECT_TYPE" == "npm" ]] && [[ -d "$TEMPLATE_ROOT/github-npm/workflows" ]]; then
+  echo "📦 Using NPM package-optimized GitHub Actions workflows"
+  tar -C "$TEMPLATE_ROOT/github-npm/workflows" -cf - . | tar -C "$TARGET/.github/workflows" -xf -
+  # Also copy NPM-specific devops scripts
+  if [[ -d "$TEMPLATE_ROOT/devops-npm/scripts" ]]; then
+    tar -C "$TEMPLATE_ROOT/devops-npm/scripts" -cf - . | tar -C "$TARGET/.devops/scripts" -xf -
+  fi
 else
   tar -C "$TEMPLATE_ROOT/github/workflows" -cf - . | tar -C "$TARGET/.github/workflows" -xf -
 fi
