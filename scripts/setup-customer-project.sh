@@ -255,6 +255,20 @@ if ! gh auth status >/dev/null 2>&1; then
   echo "GitHub CLI is not authenticated. Run 'gh auth login' first." >&2
   exit 1
 fi
+SSH_KEY_PRESENT=false
+for key in ~/.ssh/github_deploy_key ~/.ssh/id_rsa ~/.ssh/id_ed25519; do
+  [[ -f "$key" ]] && SSH_KEY_PRESENT=true
+done
+
+REMOTE_URL="git@github.com:${GITHUB_REPO}.git"
+GIT_PUSH_EXTRA=()
+if [[ "$SSH_KEY_PRESENT" == false ]]; then
+  TOKEN="$(gh auth token 2>/dev/null || true)"
+  REMOTE_URL="https://github.com/${GITHUB_REPO}.git"
+  if [[ -n "$TOKEN" ]]; then
+    GIT_PUSH_EXTRA=( -c "http.https://github.com/.extraheader=AUTHORIZATION: bearer ${TOKEN}" )
+  fi
+fi
 
 # Check DB connectivity
 run_psql "SELECT 1;" >/dev/null
@@ -273,6 +287,7 @@ rsync -a --delete \
   "$TEMPLATE_DIR"/ "$PROJECT_DIR"/
 
 cd "$PROJECT_DIR"
+git config --global --add safe.directory "$PROJECT_DIR" || true
 rm -f setup-customer.sh
 git init >/dev/null
 git checkout -b dev >/dev/null 2>&1 || git branch -M dev
@@ -323,10 +338,10 @@ fi
 
 git add -A
 git commit -m "feat: initial ${PROJECT_NAME} setup" >/dev/null
-git remote add origin "https://github.com/${GITHUB_REPO}.git" 2>/dev/null || git remote set-url origin "https://github.com/${GITHUB_REPO}.git"
-git push -u origin dev >/dev/null
+git remote add origin "${REMOTE_URL}" 2>/dev/null || git remote set-url origin "${REMOTE_URL}"
+git "${GIT_PUSH_EXTRA[@]}" push -u origin dev >/dev/null
 git checkout -B main >/dev/null
-git push -u origin main >/dev/null
+git "${GIT_PUSH_EXTRA[@]}" push -u origin main >/dev/null
 gh repo edit "$GITHUB_REPO" --default-branch main >/dev/null
 git checkout dev >/dev/null
 
@@ -373,7 +388,23 @@ if [[ "$SKIP_CERTBOT" == false ]]; then
 fi
 
 log "Installing dependencies and building"
-npm ci --silent
+npm_token_env="${NPM_TOKEN:-}"
+if [[ -z "$npm_token_env" ]]; then
+  npm_token_env="$(gh auth token 2>/dev/null || true)"
+fi
+tmp_npmrc="$(mktemp)"
+if [[ -f .npmrc ]]; then
+  cat .npmrc > "$tmp_npmrc"
+fi
+if [[ -n "$npm_token_env" ]]; then
+  echo "//npm.pkg.github.com/:_authToken=${npm_token_env}" >> "$tmp_npmrc"
+fi
+npm ci --silent --userconfig "$tmp_npmrc"
+npm_exit=$?
+rm -f "$tmp_npmrc"
+if [[ $npm_exit -ne 0 ]]; then
+  exit $npm_exit
+fi
 npm run build --if-present >/dev/null
 
 log "Deploying to ${DEPLOY_PATH}"
