@@ -415,7 +415,7 @@ npm ci --silent --userconfig "$tmp_npmrc"
 npm_exit=$?
 if [[ $npm_exit -eq 0 && ${#NPM_EXTRA_PACKAGES[@]} -gt 0 ]]; then
   log "Installing extra packages: ${NPM_EXTRA_PACKAGES[*]}"
-  npm install --silent --no-save --userconfig "$tmp_npmrc" "${NPM_EXTRA_PACKAGES[@]}"
+  npm install --silent --no-save --userconfig "$tmp_npmrc" --fetch-retries=3 --legacy-peer-deps "${NPM_EXTRA_PACKAGES[@]}"
   npm_exit=$?
 fi
 rm -f "$tmp_npmrc"
