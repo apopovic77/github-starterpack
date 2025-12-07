@@ -315,10 +315,17 @@ if [[ -z "$ENCRYPTED_TOKEN" ]]; then
   exit 1
 fi
 
-PROJECT_ID="$(run_psql "INSERT INTO projects (name, repo_url, github_owner, github_repo, default_branch, github_token_encrypted, local_path, created_at) VALUES ('${PROJECT_NAME}', 'https://github.com/${GITHUB_REPO}', '${REPO_OWNER}', '${PROJECT_NAME}', 'main', '${ENCRYPTED_TOKEN}', '${PROJECT_DIR}', NOW()) RETURNING id;" | tr -d '[:space:]')"
-if [[ -z "$PROJECT_ID" ]]; then
-  echo "Failed to create project in database" >&2
-  exit 1
+EXISTING_PROJECT_ID="$(run_psql "SELECT id FROM projects WHERE name = '${PROJECT_NAME}' LIMIT 1;" | tr -d '[:space:]')"
+if [[ -n "$EXISTING_PROJECT_ID" ]]; then
+  PROJECT_ID="$EXISTING_PROJECT_ID"
+  run_psql "UPDATE projects SET repo_url='https://github.com/${GITHUB_REPO}', github_owner='${REPO_OWNER}', github_repo='${PROJECT_NAME}', local_path='${PROJECT_DIR}' WHERE id=${PROJECT_ID};" >/dev/null
+  echo "  ✓ Reusing existing project id ${PROJECT_ID}"
+else
+  PROJECT_ID="$(run_psql "INSERT INTO projects (name, repo_url, github_owner, github_repo, default_branch, github_token_encrypted, local_path, created_at) VALUES ('${PROJECT_NAME}', 'https://github.com/${GITHUB_REPO}', '${REPO_OWNER}', '${PROJECT_NAME}', 'main', '${ENCRYPTED_TOKEN}', '${PROJECT_DIR}', NOW()) RETURNING id;" | tr -d '[:space:]')"
+  if [[ -z "$PROJECT_ID" ]]; then
+    echo "Failed to create project in database" >&2
+    exit 1
+  fi
 fi
 
 run_psql "INSERT INTO project_members (user_id, project_id, role, created_at) VALUES (${ADMIN_USER_ID}, ${PROJECT_ID}, 'owner', NOW()) ON CONFLICT DO NOTHING;" >/dev/null
