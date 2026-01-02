@@ -1,0 +1,95 @@
+name: iOS Build & Test
+
+on:
+  push:
+    branches:
+      - dev
+      - feature/**
+  pull_request:
+    branches:
+      - {{MAIN_BRANCH}}
+      - dev
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: macos-{{MACOS_VERSION}}
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Select Xcode version
+        run: sudo xcode-select -s /Applications/Xcode_{{XCODE_VERSION}}.app
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Cache CocoaPods
+        uses: actions/cache@v4
+        with:
+          path: Pods
+          key: ${{ runner.os }}-pods-${{ hashFiles('**/Podfile.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-pods-
+
+      - name: Cache Swift Package Manager
+        uses: actions/cache@v4
+        with:
+          path: |
+            .build
+            ~/Library/Developer/Xcode/DerivedData
+          key: ${{ runner.os }}-spm-${{ hashFiles('**/Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-spm-
+
+      - name: Install CocoaPods dependencies
+        if: hashFiles('Podfile') != ''
+        run: |
+          gem install cocoapods
+          pod install --repo-update
+
+      - name: Build iOS App
+        run: |
+          xcodebuild \
+            -{{WORKSPACE_OR_PROJECT}} {{PROJECT_NAME}}.{{WORKSPACE_EXT}} \
+            -scheme {{SCHEME_NAME}} \
+            -sdk iphonesimulator \
+            -destination 'platform=iOS Simulator,name={{SIMULATOR_DEVICE}},OS={{IOS_VERSION}}' \
+            -configuration Debug \
+            clean build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            | xcpretty --color
+
+      - name: Run Unit Tests
+        run: |
+          xcodebuild test \
+            -{{WORKSPACE_OR_PROJECT}} {{PROJECT_NAME}}.{{WORKSPACE_EXT}} \
+            -scheme {{SCHEME_NAME}} \
+            -sdk iphonesimulator \
+            -destination 'platform=iOS Simulator,name={{SIMULATOR_DEVICE}},OS={{IOS_VERSION}}' \
+            -configuration Debug \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            | xcpretty --color --test
+
+      - name: Upload Test Results
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: |
+            ~/Library/Developer/Xcode/DerivedData/**/Logs/Test/*.xcresult
+
+      - name: Notify on success
+        if: success()
+        run: echo "✅ Build and tests passed for ${{ github.sha }}"
+
+      - name: Notify on failure
+        if: failure()
+        run: echo "❌ Build or tests failed for ${{ github.sha }}"

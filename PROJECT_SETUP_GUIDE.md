@@ -24,6 +24,7 @@ Dieses Dokument beschreibt wie neue Projekte aufgesetzt werden - vom ersten Comm
 2. **Python FastAPI Services** → Deployment zu arkserver mit OpenAPI SDK Generation
 3. **Node.js APIs** → Deployment zu arkturian.com
 4. **PHP Apps** → Deployment zu arkturian.com
+5. **iOS Apps** → Build & Test auf macOS Runner, Deploy zu TestFlight/App Store
 
 ---
 
@@ -761,6 +762,186 @@ cd mein-php-app
 
 ---
 
+## 5️⃣ iOS App (Swift/Xcode)
+
+### Use Cases
+- Native iOS Apps
+- SwiftUI Applications
+- React Native iOS Builds
+- Flutter iOS Builds
+
+### Wichtig: macOS Runner erforderlich!
+
+iOS Apps können **nur auf macOS** gebaut werden. GitHub Actions bietet macOS Runner:
+- `macos-latest` (macOS 14 Sonoma)
+- `macos-13` (macOS 13 Ventura)
+- `macos-14` (macOS 14 Sonoma)
+
+**Kosten:** macOS Runner sind 10x teurer als Linux Runner (2000 min/Monat im Free Tier)
+
+### Voraussetzungen
+
+1. **Apple Developer Account** ($99/Jahr)
+2. **App Store Connect API Key** (für automatisches Deployment)
+3. **Fastlane Match** Repository für Certificates & Profiles
+
+### Initial Setup
+
+```bash
+cd /Volumes/DatenAP/Code/mein-ios-app
+
+# 1. Git initialisieren (falls noch nicht)
+git init
+git branch -M main
+git checkout -b dev
+
+# 2. GitHub Repo erstellen
+gh repo create apopovic77/mein-ios-app --private --source=. --remote=origin
+
+# 3. Fastlane initialisieren
+gem install fastlane
+fastlane init
+
+# 4. iOS Workflow Templates kopieren
+mkdir -p .github/workflows
+cp /Volumes/DatenAP/Code/github-starterpack/templates/github-ios/workflows/* .github/workflows/
+
+# 5. Fastlane Templates kopieren
+cp /Volumes/DatenAP/Code/github-starterpack/templates/github-ios/fastlane/* fastlane/
+
+# 6. Placeholders ersetzen in allen Dateien:
+# {{PROJECT_NAME}} → MeinApp
+# {{SCHEME_NAME}} → MeinApp
+# {{BUNDLE_IDENTIFIER}} → com.arkturian.meinapp
+# {{TEAM_ID}} → XXXXXXXXXX (Apple Team ID)
+# {{XCODE_VERSION}} → 15.2
+# {{MACOS_VERSION}} → 14
+# {{IOS_VERSION}} → 17.2
+# {{SIMULATOR_DEVICE}} → iPhone 15 Pro
+# {{WORKSPACE_OR_PROJECT}} → workspace (oder project)
+# {{WORKSPACE_EXT}} → xcworkspace (oder xcodeproj)
+# {{MAIN_BRANCH}} → main
+# {{GITHUB_ORG}} → apopovic77
+
+# 7. Initial commit
+git add .
+git commit -m "Add iOS CI/CD configuration"
+git push -u origin dev
+```
+
+### GitHub Secrets konfigurieren
+
+```bash
+cd /Volumes/DatenAP/Code/mein-ios-app
+
+# App Store Connect API Key
+# Erstelle unter: https://appstoreconnect.apple.com/access/api
+gh secret set ASC_KEY_ID --body "XXXXXXXXXX"
+gh secret set ASC_ISSUER_ID --body "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+gh secret set ASC_KEY_CONTENT --body "$(cat ~/AuthKey_XXXXXXXXXX.p8)"
+
+# Fastlane Match (Certificate Repository)
+gh secret set MATCH_PASSWORD --body "dein-match-passwort"
+gh secret set MATCH_GIT_URL --body "git@github.com:apopovic77/certificates.git"
+gh secret set MATCH_GIT_BASIC_AUTHORIZATION --body "$(echo -n 'username:token' | base64)"
+```
+
+### Fastlane Match Setup (Einmalig)
+
+```bash
+# 1. Certificates Repository erstellen
+gh repo create apopovic77/certificates --private
+
+# 2. Match initialisieren
+fastlane match init
+# Wähle: git
+# Gib URL ein: git@github.com:apopovic77/certificates.git
+
+# 3. Certificates generieren (nur vom Dev Mac!)
+fastlane match development
+fastlane match appstore
+
+# Die Certificates werden encrypted im Git Repo gespeichert
+```
+
+### Workflow Templates
+
+**Build & Test (templates/github-ios/workflows/build.yml):**
+- Läuft bei Push zu `dev` und PRs
+- Baut die App im Simulator
+- Führt Unit Tests aus
+- Cached CocoaPods und SPM
+
+**Deploy zu TestFlight (templates/github-ios/workflows/deploy.yml):**
+- Läuft bei Push zu `main`
+- Installiert Certificates via Match
+- Baut signierte IPA
+- Uploaded zu TestFlight
+
+### Development Workflow
+
+```bash
+# Feature entwickeln
+git checkout -b feature/mein-feature dev
+# ... code changes ...
+git commit -m "feature: beschreibung"
+git push origin feature/mein-feature
+
+# PR erstellen → Build & Test läuft automatisch
+gh pr create --base dev
+
+# Nach Merge zu dev: Weiter entwickeln
+# Nach Merge zu main: Deploy zu TestFlight
+
+# Release zu Production (manuell von dev zu main)
+git checkout main
+git merge dev
+git push origin main
+# → GitHub Actions baut und deployed zu TestFlight
+```
+
+### Placeholder Reference
+
+| Placeholder | Beispiel | Beschreibung |
+|------------|----------|--------------|
+| `{{PROJECT_NAME}}` | MeinApp | Xcode Project Name |
+| `{{SCHEME_NAME}}` | MeinApp | Build Scheme |
+| `{{BUNDLE_IDENTIFIER}}` | com.arkturian.meinapp | Bundle ID |
+| `{{TEAM_ID}}` | A1B2C3D4E5 | Apple Developer Team ID |
+| `{{XCODE_VERSION}}` | 15.2 | Xcode Version auf Runner |
+| `{{MACOS_VERSION}}` | 14 | macOS Runner Version |
+| `{{IOS_VERSION}}` | 17.2 | iOS Simulator Version |
+| `{{SIMULATOR_DEVICE}}` | iPhone 15 Pro | Simulator für Tests |
+| `{{WORKSPACE_OR_PROJECT}}` | workspace | `workspace` oder `project` |
+| `{{WORKSPACE_EXT}}` | xcworkspace | `xcworkspace` oder `xcodeproj` |
+| `{{MAIN_BRANCH}}` | main | Production Branch |
+| `{{GITHUB_ORG}}` | apopovic77 | GitHub Username/Org |
+
+### Alternative: Codemagic (Spezialisiert auf Mobile)
+
+Falls GitHub Actions zu teuer wird:
+
+```yaml
+# codemagic.yaml
+workflows:
+  ios-workflow:
+    name: iOS Build
+    instance_type: mac_mini_m1
+    environment:
+      xcode: 15.2
+      cocoapods: default
+    scripts:
+      - pod install
+      - xcodebuild build -workspace MeinApp.xcworkspace -scheme MeinApp
+    artifacts:
+      - build/ios/ipa/*.ipa
+    publishing:
+      app_store_connect:
+        api_key: $APP_STORE_CONNECT_PRIVATE_KEY
+```
+
+---
+
 ## 📋 Checkliste: Neues Projekt Setup
 
 ### Für jeden Projekt-Typ
@@ -793,6 +974,22 @@ cd mein-php-app
 - [ ] setup-server.sh ausführen für initialen Setup
 - [ ] cleanup-server.sh testen (Idempotenz)
 - [ ] deploy-to-server.sh testen
+
+### Zusätzlich für iOS Apps
+
+- [ ] Apple Developer Account aktiv ($99/Jahr)
+- [ ] App Store Connect API Key erstellt
+- [ ] GitHub Secrets konfiguriert:
+  - [ ] `ASC_KEY_ID` (App Store Connect Key ID)
+  - [ ] `ASC_ISSUER_ID` (App Store Connect Issuer ID)
+  - [ ] `ASC_KEY_CONTENT` (API Key .p8 Inhalt)
+  - [ ] `MATCH_PASSWORD` (Fastlane Match Encryption Password)
+  - [ ] `MATCH_GIT_URL` (Certificate Repository URL)
+  - [ ] `MATCH_GIT_BASIC_AUTHORIZATION` (Git Auth für Match)
+- [ ] Fastlane Match Repository erstellt
+- [ ] Certificates via Match generiert
+- [ ] Build auf macOS Runner getestet
+- [ ] TestFlight Upload getestet
 
 ---
 
@@ -1011,6 +1208,21 @@ npx @openapitools/openapi-generator-cli generate \
 11. Verifiziere: `curl https://[subdomain].arkserver.arkturian.com/health`
 12. Falls SDK: Verifiziere NPM Package
 
+### Wenn User sagt: "iOS App CI/CD aufsetzen"
+
+1. Frage nach Projekt-Pfad und ob bereits Xcode Projekt existiert
+2. Folge Abschnitt "5️⃣ iOS App"
+3. Prüfe ob Apple Developer Account vorhanden
+4. Kopiere Workflow Templates nach `.github/workflows/`
+5. Kopiere Fastlane Templates nach `fastlane/`
+6. Ersetze alle Placeholders (PROJECT_NAME, BUNDLE_ID, etc.)
+7. Erstelle Fastlane Match Repository (falls nicht vorhanden)
+8. Konfiguriere GitHub Secrets (ASC_KEY, MATCH, etc.)
+9. Erstelle Initial Commit
+10. Push zu GitHub
+11. Teste Build auf macOS Runner
+12. Teste TestFlight Upload
+
 ### Wichtige Pfade
 
 - **Repos:** `/Volumes/DatenAP/Code/`
@@ -1037,6 +1249,7 @@ npx @openapitools/openapi-generator-cli generate \
 ---
 
 **Version History:**
+- v1.2 (2025-12-31): Added iOS App CI/CD templates (macOS Runner, Fastlane, TestFlight)
 - v1.1 (2025-11-28): Added comprehensive SSH setup and troubleshooting section
 - v1.0 (2025-11-28): Initial version mit React, Python API, SDK Generation
 

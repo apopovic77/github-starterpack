@@ -1,0 +1,17 @@
+# Appfile for Fastlane
+# Template from github-starterpack
+
+# App Identifier (Bundle ID)
+app_identifier("{{BUNDLE_IDENTIFIER}}")
+
+# Apple Developer Portal Team ID
+team_id("{{TEAM_ID}}")
+
+# App Store Connect Team ID (usually same as team_id)
+itc_team_id("{{TEAM_ID}}")
+
+# Apple ID (email) - Optional, API Key is preferred
+# apple_id("your@email.com")
+
+# For more information about the Appfile, see:
+# https://docs.fastlane.tools/advanced/#appfile

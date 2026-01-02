@@ -267,10 +267,35 @@ if ! gh auth status >/dev/null 2>&1; then
   echo "GitHub CLI is not authenticated. Run 'gh auth login' first." >&2
   exit 1
 fi
-SSH_KEY_PRESENT=false
-for key in ~/.ssh/github_deploy_key ~/.ssh/id_rsa ~/.ssh/id_ed25519; do
-  [[ -f "$key" ]] && SSH_KEY_PRESENT=true
-done
+
+ensure_deploy_key() {
+  local key_path="${1:-$HOME/.ssh/github_deploy_key}"
+  mkdir -p "$(dirname "$key_path")"
+  if [[ ! -f "$key_path" ]]; then
+    echo "Generating deploy SSH key at ${key_path}"
+    ssh-keygen -t ed25519 -N "" -C "deploy-${PROJECT_NAME}@${DOMAIN_SUFFIX}" -f "$key_path" >/dev/null
+  fi
+  chmod 600 "$key_path"
+
+  # Ensure the public key is authorized for the deploy user
+  local pub="${key_path}.pub"
+  local ssh_user_home
+  ssh_user_home="$(getent passwd "$SSH_USER" | cut -d: -f6 || true)"
+  ssh_user_home="${ssh_user_home:-/root}"
+  mkdir -p "${ssh_user_home}/.ssh"
+  touch "${ssh_user_home}/.ssh/authorized_keys"
+  if ! grep -q "$(cat "$pub")" "${ssh_user_home}/.ssh/authorized_keys"; then
+    echo "Adding deploy public key to ${ssh_user_home}/.ssh/authorized_keys"
+    cat "$pub" >> "${ssh_user_home}/.ssh/authorized_keys"
+    chmod 700 "${ssh_user_home}/.ssh"
+    chmod 600 "${ssh_user_home}/.ssh/authorized_keys"
+  fi
+  DEPLOY_KEY_PATH="$key_path"
+}
+
+DEPLOY_KEY_PATH="$HOME/.ssh/github_deploy_key"
+ensure_deploy_key "$DEPLOY_KEY_PATH"
+SSH_KEY_PRESENT=true
 
 REMOTE_URL="git@github.com:${GITHUB_REPO}.git"
 GIT_PUSH_EXTRA=()
@@ -365,15 +390,9 @@ gh repo edit "$GITHUB_REPO" --default-branch main >/dev/null
 git checkout dev >/dev/null
 
 log "Configuring GitHub secrets"
-SSH_KEY_CONTENT="$(cat ~/.ssh/github_deploy_key 2>/dev/null || cat ~/.ssh/id_rsa 2>/dev/null || true)"
-if [[ -z "$SSH_KEY_CONTENT" ]]; then
-  echo "Warning: could not find deploy SSH key (~/.ssh/github_deploy_key or ~/.ssh/id_rsa). Repo secrets will miss DEPLOY_SSH_KEY." >&2
-fi
 gh secret set DEPLOY_HOST --repo "$GITHUB_REPO" --body "$DOMAIN_SUFFIX" >/dev/null
 gh secret set DEPLOY_USER --repo "$GITHUB_REPO" --body "$SSH_USER" >/dev/null
-if [[ -n "$SSH_KEY_CONTENT" ]]; then
-  gh secret set DEPLOY_SSH_KEY --repo "$GITHUB_REPO" --body "$SSH_KEY_CONTENT" >/dev/null
-fi
+gh secret set DEPLOY_SSH_KEY --repo "$GITHUB_REPO" --body "$(cat "$DEPLOY_KEY_PATH")" >/dev/null
 gh secret set DEPLOY_PORT --repo "$GITHUB_REPO" --body "22" >/dev/null
 gh secret set DEPLOY_PATH --repo "$GITHUB_REPO" --body "$DEPLOY_PATH" >/dev/null
 gh secret set NPM_TOKEN --repo "$GITHUB_REPO" --body "$(gh auth token)" >/dev/null
