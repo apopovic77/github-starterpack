@@ -62,6 +62,22 @@ echo -e "${GREEN}📍 Deployed to: $DEPLOY_PATH${NC}"
 echo -e "${GREEN}💾 Backup saved: $BACKUP_PATH${NC}"
 echo -e "${GREEN}🕒 Timestamp: $TIMESTAMP${NC}"
 
+# Retention: prune old backups of THIS project only (prefix-scoped), keep
+# the newest $BACKUP_KEEP. Runs after the success message, so a failed
+# deploy never deletes anything and rollback.sh always has generations to
+# offer. Without this, every deploy grows /var/backups unbounded — api-ai
+# reached 37 generations = 13G and pushed arkturian to 98% disk (#214).
+# `|| true`: under `set -euo pipefail` an unmatched glob makes ls exit 2
+# and would abort an otherwise-successful deploy.
+BACKUP_KEEP="${BACKUP_KEEP:-3}"
+if [ -n "$BACKUP_PREFIX" ] && [ -d "$BACKUP_DIR" ]; then
+  echo -e "${YELLOW}🧹 Pruning old backups (keeping newest $BACKUP_KEEP)...${NC}"
+  ls -dt "$BACKUP_DIR/${BACKUP_PREFIX}-"* 2>/dev/null | tail -n +$((BACKUP_KEEP + 1)) | while read -r old_backup; do
+    rm -rf "$old_backup"
+    echo -e "  pruned: $old_backup"
+  done || true
+fi
+
 echo -e "\n${GREEN}📊 Deployment Summary:${NC}"
 echo -e "  Repository: $REPO_PATH"
 echo -e "  Deployment: $DEPLOY_PATH"

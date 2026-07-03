@@ -255,6 +255,23 @@ else
     exit 1
 fi
 
+# Retention: prune old backups of THIS service on the server (prefix-scoped),
+# keep the newest $BACKUP_KEEP. Runs only after the health check passed, so a
+# failed deploy never deletes and rollback keeps generations to offer. Without
+# this every deploy grows /var/backups unbounded — api-ai hit 37 generations
+# = 13G and pushed arkturian to 98% disk (#214). The trailing `|| true` inside
+# the remote shell guards the unmatched-glob case (ls exit 2 under pipefail).
+BACKUP_KEEP="${CFG_backup_keep:-3}"
+if [ "$BACKUP_ENABLED" = "true" ] && [ -n "$BACKUP_PREFIX" ]; then
+    echo -e "${YELLOW}🧹 Pruning old backups (keeping newest $BACKUP_KEEP)...${NC}"
+    ssh "$SERVER_USER@$SERVER_HOST" bash << EOF
+ls -dt "$BACKUP_DIR/${BACKUP_PREFIX}-"* 2>/dev/null | tail -n +$((BACKUP_KEEP + 1)) | while read -r old_backup; do
+    rm -rf "\$old_backup"
+    echo "  pruned: \$old_backup"
+done || true
+EOF
+fi
+
 echo ""
 echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo -e "${GREEN}✅ Deployment completed successfully!${NC}"
