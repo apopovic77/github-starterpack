@@ -70,6 +70,15 @@ jobs:
             echo "Deployment completed successfully!"
             echo "Backup saved to: $BACKUP_PATH"
 
+            # Retention: keep newest 3 backups of THIS project (prefix-scoped).
+            # Runs only after success (set -e above). Unbounded backups filled
+            # arkturian to 98% disk (api-ai: 37 generations = 13G, issue #214).
+            BACKUP_KEEP=3
+            ls -dt "$BACKUP_DIR/${BACKUP_PREFIX}-"* 2>/dev/null | tail -n +$((BACKUP_KEEP + 1)) | while read -r old_backup; do
+              rm -rf "$old_backup"
+              echo "  pruned old backup: $old_backup"
+            done || true
+
       - name: Notify on success
         if: success()
         run: echo "✅ Deployment successful for commit ${{ github.sha }}"
