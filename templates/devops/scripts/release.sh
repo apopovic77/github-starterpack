@@ -71,7 +71,44 @@ fi
 
 git push origin "$MAIN_BRANCH"
 
-printf '\n✅ Release pushed. GitHub Actions will build & deploy from %s.\n' "$MAIN_BRANCH"
+# Rollt der Push wirklich aus? Diese Zeile behauptete es bedingungslos — und
+# lag in jedem Projekt falsch, das den Push-Ausloeser abgeschaltet hat. Genau
+# das ist bei tschepp-ar-web im Juli passiert (gleichzeitige Deploys hinter-
+# liessen ein halb geschriebenes dist/), und seitdem meldete `devops release`
+# monatelang Erfolg, ohne dass etwas ausgerollt wurde. Aufgefallen ist es erst,
+# als zwei Agenten sich gegenseitig ueberschrieben (2026-08-11).
+#
+# Deshalb wird jetzt NACHGESEHEN statt behauptet. Die Vorlagen dieses
+# Starterpacks tragen den Push-Ausloeser weiterhin — dort bleibt alles wie
+# gehabt, und ein zusaetzlicher Anstoss waere sogar schaedlich: zwei Deploys
+# auf denselben Commit sind wieder das halb geschriebene dist/.
+DEPLOY_WORKFLOW="${DEPLOY_WORKFLOW:-.github/workflows/deploy.yml}"
+DEPLOY_WORKFLOW_NAME="${DEPLOY_WORKFLOW_NAME:-Build & Deploy}"
+
+push_loest_deploy_aus() {
+  [ -f "$DEPLOY_WORKFLOW" ] || return 1
+  # `on:`-Block bis zum naechsten Top-Level-Schluessel; enthaelt er `push:`,
+  # startet der Push den Lauf selbst.
+  awk '/^on:/{drin=1; next} /^[a-zA-Z]/{drin=0} drin' "$DEPLOY_WORKFLOW" \
+    | grep -q '^[[:space:]]*push:'
+}
+
+if push_loest_deploy_aus; then
+  printf '\n✅ Release pushed. Der Push startet den Deploy von %s.\n' "$MAIN_BRANCH"
+elif command -v gh >/dev/null 2>&1; then
+  printf '\n==> %s reagiert nicht auf Push — Deploy wird angestossen\n' "$DEPLOY_WORKFLOW"
+  if gh workflow run "$DEPLOY_WORKFLOW_NAME" --ref "$MAIN_BRANCH"; then
+    printf '\n✅ Release gepusht und Deploy angestossen (%s).\n' "$MAIN_BRANCH"
+    printf '   Stand: gh run list --workflow "%s" --limit 1\n' "$DEPLOY_WORKFLOW_NAME"
+  else
+    printf '\n⚠️  Push ok, Deploy NICHT angestossen. Von Hand:\n' >&2
+    printf '   gh workflow run "%s" --ref %s\n' "$DEPLOY_WORKFLOW_NAME" "$MAIN_BRANCH" >&2
+  fi
+else
+  printf '\n⚠️  Release gepusht — aber NICHT ausgerollt.\n' >&2
+  printf '   %s reagiert nicht auf Push, und `gh` fehlt. Von Hand:\n' "$DEPLOY_WORKFLOW" >&2
+  printf '   gh workflow run "%s" --ref %s\n' "$DEPLOY_WORKFLOW_NAME" "$MAIN_BRANCH" >&2
+fi
 
 printf '\n==> Switching back to %s\n' "$DEV_BRANCH"
 "$CHECKOUT_SCRIPT" "$DEV_BRANCH"
