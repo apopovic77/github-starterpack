@@ -10,7 +10,8 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # Fest self-hosted (Regel 07.10.2026: keine GitHub-gehosteten Runner).
+    runs-on: [self-hosted, linux, arkserver]
 
     steps:
       - uses: actions/checkout@v4
@@ -19,7 +20,14 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '{{NODE_VERSION}}'
-          cache: 'npm'
+          # cache: 'npm' bewusst nicht gesetzt (self-hosted-Haenger im Post-Step).
+
+      - name: Authenticate to GitHub Packages
+        # Fuer private npm-Scopes (@arkturian, @apopovic77 u.a.).
+        if: ${{ env.NPM_TOKEN != '' }}
+        run: echo "//npm.pkg.github.com/:_authToken=${NPM_TOKEN}" >> .npmrc
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Install dependencies
         run: {{INSTALL_DEPS_COMMAND}}

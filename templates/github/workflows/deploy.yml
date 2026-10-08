@@ -8,7 +8,10 @@ on:
 
 jobs:
   build-and-deploy:
-    runs-on: ubuntu-latest
+    # Fest self-hosted (Regel 07.10.2026: keine GitHub-gehosteten Runner,
+    # das Konto hat sie gesperrt). Repos ohne arkserver-Runner stattdessen
+    # Variable RUNNER_LABEL=arkserver + Fallback-Zeile nutzen.
+    runs-on: [self-hosted, linux, arkserver]
 
     steps:
       - name: Checkout code
@@ -18,7 +21,16 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '{{NODE_VERSION}}'
-          cache: 'npm'
+          # cache: 'npm' bewusst nicht gesetzt — der setup-node-Post-Step
+          # haengt auf self-hosted-Runnern beim cache-save (Issue 3dNerd 2026-10-08).
+
+      - name: Authenticate to GitHub Packages
+        # Fuer private npm-Scopes (@arkturian, @apopovic77 u.a.). Skip, wenn
+        # NPM_TOKEN leer ist — dann publiziert das Repo keine privaten Deps.
+        if: ${{ env.NPM_TOKEN != '' }}
+        run: echo "//npm.pkg.github.com/:_authToken=${NPM_TOKEN}" >> .npmrc
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Install dependencies
         run: {{INSTALL_DEPS_COMMAND}}
@@ -28,12 +40,30 @@ jobs:
         env:
           NODE_ENV: production
 
+      - name: Guard - private DEPLOY_HOST braucht self-hosted Runner
+        # NAT-Hairpin-Guard (04.09.2026): wenn DEPLOY_HOST eine private IP
+        # ist (self-loop zum arkserver), muss der Runner self-hosted auf
+        # arkserver laufen. Fuer `runs-on: [self-hosted, linux, arkserver]`
+        # oben greift das immer; der Check ist Backup fuer Varianten mit
+        # `runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}`.
+        run: |
+          case "${{ secrets.DEPLOY_HOST }}" in
+            10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*)
+              if [ -z "${{ vars.RUNNER_LABEL }}" ] && ! echo "${{ runner.name }}" | grep -q arkserver; then
+                echo "::error::DEPLOY_HOST ist privat, aber kein arkserver-Runner - SSH wuerde in einen NAT-Timeout laufen."
+                exit 1
+              fi ;;
+          esac
+
       - name: Deploy to server
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
+          # Fuer arkserver auf port 2224 setzen (DEPLOY_PORT-Secret); fuer
+          # andere Hosts auf den jeweiligen Port. Default 22 nur fuer Repos,
+          # die DEPLOY_PORT bewusst nicht setzen.
           port: ${{ secrets.DEPLOY_PORT || 22 }}
           script: |
             set -e
