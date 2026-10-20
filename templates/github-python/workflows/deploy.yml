@@ -1,0 +1,65 @@
+name: Deploy to Production
+
+on:
+  push:
+    branches:
+      - {{MAIN_BRANCH}}
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    # DEPLOY_HOST ist die LAN-Adresse von arkserver; nur der eigene Runner erreicht sie.
+    # GitHub-gehostete Runner sind fuer dieses Konto gesperrt (apopovic77_spending_block).
+    runs-on: [self-hosted, linux, arkserver]
+
+    steps:
+      - name: Deploy to server
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ secrets.DEPLOY_PORT }}
+          script: |
+            set -e
+            DEPLOY_PATH={{DEPLOY_PATH}}
+            cd "$DEPLOY_PATH"
+
+            # Git-Checkout auf dem Server (gleiches Muster wie finance-api/conversation-api).
+            # Erster Deploy legt .git an; Folge-Deploys fetchen und hard-reset'en auf main.
+            if [ ! -d .git ]; then
+              git init -q
+              git remote add origin {{REPO_SSH_URL}}
+            fi
+            PREVIOUS=$(git rev-parse --verify -q HEAD || echo none)
+            git fetch -q origin {{MAIN_BRANCH}}
+            git reset -q --hard origin/{{MAIN_BRANCH}}
+            echo "Deploy $PREVIOUS -> $(git rev-parse --short HEAD)"
+
+            if [ ! -d venv ]; then
+              python{{PYTHON_VERSION}} -m venv venv
+            fi
+            venv/bin/pip install -q -r {{REQUIREMENTS_FILE}}
+
+            # Dienst laeuft als {{SERVICE_USER}}; Ordner bleibt {{SERVICE_USER}}:{{SERVICE_GROUP}} mit setgid.
+            chown -R {{SERVICE_USER}}:{{SERVICE_GROUP}} "$DEPLOY_PATH"
+            systemctl restart {{SERVICE_NAME}}
+
+      - name: Verify deployment
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ secrets.DEPLOY_PORT }}
+          script: |
+            for i in $(seq 1 15); do
+              if curl -sf http://127.0.0.1:{{SERVICE_PORT}}{{HEALTH_PATH}} >/dev/null 2>&1; then
+                echo "{{SERVICE_NAME}} healthy (nach $((i*2))s)"
+                exit 0
+              fi
+              sleep 2
+            done
+            echo "Health check failed nach 30s"
+            journalctl -u {{SERVICE_NAME}} -n 30 --no-pager || true
+            exit 1
