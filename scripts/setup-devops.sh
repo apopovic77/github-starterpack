@@ -285,6 +285,50 @@ if [[ -z "$STARTER_PATH" ]]; then
   STARTER_PATH="$(cd "$SCRIPT_DIR/.." && pwd)"
 fi
 
+# STARTER_PATH guards:
+# - Reject ephemeral paths (/tmp, scratchpad): update-devops.sh later resolves
+#   from this value; a /tmp path is gone after reboot and leaves the repo
+#   unable to self-update.
+# - If the canonical arkserver clone exists at /var/code/github-starterpack and
+#   the current STARTER_PATH is NOT it, suggest it. Non-interactive run keeps
+#   the current path but prints a warning so the operator sees it in logs.
+CANONICAL_STARTER_PATH="/var/code/github-starterpack"
+
+case "$STARTER_PATH" in
+  /tmp/*|/private/tmp/*|/var/folders/*)
+    echo "⚠️  STARTER_PATH is in a temp location: $STARTER_PATH" >&2
+    echo "    update-devops.sh will write this path into .devops/starter-config.json" >&2
+    echo "    and templates/devops/scripts/update-devops.sh (DEFAULT_STARTER_PATH)." >&2
+    echo "    A temp path breaks later self-updates once the directory is gone." >&2
+    if [[ -x "$CANONICAL_STARTER_PATH/scripts/setup-devops.sh" ]]; then
+      echo "    Canonical starter pack is available at $CANONICAL_STARTER_PATH." >&2
+      if [[ "$NON_INTERACTIVE" == false ]]; then
+        read -rp "Use $CANONICAL_STARTER_PATH instead? [Y/n]: " _starter_choice
+        if [[ -z "$_starter_choice" ]] || [[ "${_starter_choice,,}" =~ ^y ]]; then
+          STARTER_PATH="$CANONICAL_STARTER_PATH"
+          echo "✅ STARTER_PATH set to $STARTER_PATH"
+        fi
+      else
+        echo "    Pass --starter-path $CANONICAL_STARTER_PATH to use the canonical copy." >&2
+      fi
+    else
+      echo "    Pass --starter-path to point at a durable clone." >&2
+    fi
+    ;;
+esac
+
+# Warn if the starter clone we're reading from is behind its remote.
+if [[ -d "$STARTER_PATH/.git" ]]; then
+  _starter_git_status=$(git -C "$STARTER_PATH" status -sb 2>/dev/null | head -1 || true)
+  case "$_starter_git_status" in
+    *behind*)
+      echo "⚠️  Starter pack clone at $STARTER_PATH is behind its remote:" >&2
+      echo "    $_starter_git_status" >&2
+      echo "    Templates may be stale. Run 'git -C $STARTER_PATH pull' before rerunning setup-devops.sh." >&2
+      ;;
+  esac
+fi
+
 default PROJECT_NAME "$(basename "$TARGET")"
 default REPO_ROOT "$TARGET"
 PROJECT_SLUG="$(slugify "$PROJECT_NAME")"
