@@ -39,6 +39,18 @@ Options:
   --web-user <user>      Web server user for chown (default www-data)
   --web-group <group>    Web server group for chown (default www-data)
   --backup-prefix <str>  Prefix for backups (default derived from project slug)
+
+Python (used when PROJECT_TYPE=python; auto-detected via requirements.txt):
+  --python-version <v>   Python interpreter version (default 3.11)
+  --service-name <n>     systemd unit name (default project slug)
+  --service-port <p>     Backend port on 127.0.0.1 (required for python)
+  --service-user <u>     systemd User= (default alex)
+  --service-group <g>    chown group on deploy path (default Developer)
+  --health-path <p>      Health endpoint path (default /health)
+  --requirements-file <f>      pip -r file for prod (default requirements.txt)
+  --requirements-dev-file <f>  pip -r file for CI/tests (default requirements-dev.txt)
+  --repo-ssh-url <url>   git remote on server (default git@github.com:apopovic77/<slug>.git)
+
   --non-interactive      Fail if required values missing instead of prompting
   --update               Re-apply templates using stored configuration
   -h, --help             Show this help message
@@ -61,6 +73,16 @@ BACKUP_PREFIX=""
 NON_INTERACTIVE=false
 UPDATE=false
 STARTER_PATH=""
+# Python-only defaults (used when PROJECT_TYPE=python)
+PYTHON_VERSION="3.11"
+SERVICE_NAME=""
+SERVICE_PORT=""
+SERVICE_USER="alex"
+SERVICE_GROUP="Developer"
+HEALTH_PATH="/health"
+REQUIREMENTS_FILE="requirements.txt"
+REQUIREMENTS_DEV_FILE="requirements-dev.txt"
+REPO_SSH_URL=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -117,6 +139,42 @@ while [[ $# -gt 0 ]]; do
       BACKUP_PREFIX="${2:-}"
       shift 2
       ;;
+    --python-version)
+      PYTHON_VERSION="${2:-}"
+      shift 2
+      ;;
+    --service-name)
+      SERVICE_NAME="${2:-}"
+      shift 2
+      ;;
+    --service-port)
+      SERVICE_PORT="${2:-}"
+      shift 2
+      ;;
+    --service-user)
+      SERVICE_USER="${2:-}"
+      shift 2
+      ;;
+    --service-group)
+      SERVICE_GROUP="${2:-}"
+      shift 2
+      ;;
+    --health-path)
+      HEALTH_PATH="${2:-}"
+      shift 2
+      ;;
+    --requirements-file)
+      REQUIREMENTS_FILE="${2:-}"
+      shift 2
+      ;;
+    --requirements-dev-file)
+      REQUIREMENTS_DEV_FILE="${2:-}"
+      shift 2
+      ;;
+    --repo-ssh-url)
+      REPO_SSH_URL="${2:-}"
+      shift 2
+      ;;
     --non-interactive)
       NON_INTERACTIVE=true
       shift
@@ -171,6 +229,17 @@ elif [[ -f "$TARGET/composer.json" ]] || ls "$TARGET"/*.php &>/dev/null; then
     BUILD_COMMAND="echo '✅ No build needed for PHP application'"
     NODE_VERSION="n/a"
   fi
+elif [[ -f "$TARGET/requirements.txt" ]] || [[ -f "$TARGET/pyproject.toml" ]]; then
+  PROJECT_TYPE="python"
+  echo "📦 Detected: Python project (FastAPI/uvicorn + systemd + arkserver)"
+  if [[ "$UPDATE" == false ]]; then
+    # Only override defaults on fresh install, not update
+    INSTALL_DEPS_COMMAND="echo '✅ Python project - venv handled by deploy workflow'"
+    BUILD_COMMAND="echo '✅ No build step for Python application'"
+    NODE_VERSION="n/a"
+    WEB_USER="$SERVICE_USER"
+    WEB_GROUP="$SERVICE_GROUP"
+  fi
 elif [[ -f "$TARGET/package.json" ]]; then
   # Check if it's an NPM package (has "main" or "types" in package.json)
   if grep -q '"main"\|"types"\|"exports"' "$TARGET/package.json" 2>/dev/null; then
@@ -222,6 +291,9 @@ PROJECT_SLUG="$(slugify "$PROJECT_NAME")"
 default BACKUP_PREFIX "$PROJECT_SLUG"
 default DEPLOY_PATH "/var/www/$PROJECT_SLUG"
 default SITE_URL "https://example.com"
+# Python defaults depending on slug
+default SERVICE_NAME "$PROJECT_SLUG"
+default REPO_SSH_URL "git@github.com:apopovic77/$PROJECT_SLUG.git"
 
 if [[ "$NON_INTERACTIVE" == false ]]; then
   read -rp "Project name [$PROJECT_NAME]: " input && [[ -n "$input" ]] && PROJECT_NAME="$input"
@@ -237,6 +309,17 @@ if [[ "$NON_INTERACTIVE" == false ]]; then
   read -rp "Web group [$WEB_GROUP]: " input && [[ -n "$input" ]] && WEB_GROUP="$input"
   read -rp "Backup prefix [$BACKUP_PREFIX]: " input && [[ -n "$input" ]] && BACKUP_PREFIX="$input"
   read -rp "Starter pack path [$STARTER_PATH]: " input && [[ -n "$input" ]] && STARTER_PATH="$input"
+  if [[ "$PROJECT_TYPE" == "python" ]]; then
+    read -rp "Python version [$PYTHON_VERSION]: " input && [[ -n "$input" ]] && PYTHON_VERSION="$input"
+    read -rp "systemd service name [$SERVICE_NAME]: " input && [[ -n "$input" ]] && SERVICE_NAME="$input"
+    read -rp "Backend port on 127.0.0.1 [$SERVICE_PORT]: " input && [[ -n "$input" ]] && SERVICE_PORT="$input"
+    read -rp "Service user [$SERVICE_USER]: " input && [[ -n "$input" ]] && SERVICE_USER="$input"
+    read -rp "Service group [$SERVICE_GROUP]: " input && [[ -n "$input" ]] && SERVICE_GROUP="$input"
+    read -rp "Health path [$HEALTH_PATH]: " input && [[ -n "$input" ]] && HEALTH_PATH="$input"
+    read -rp "requirements file [$REQUIREMENTS_FILE]: " input && [[ -n "$input" ]] && REQUIREMENTS_FILE="$input"
+    read -rp "requirements-dev file [$REQUIREMENTS_DEV_FILE]: " input && [[ -n "$input" ]] && REQUIREMENTS_DEV_FILE="$input"
+    read -rp "Repository SSH URL [$REPO_SSH_URL]: " input && [[ -n "$input" ]] && REPO_SSH_URL="$input"
+  fi
 fi
 
 for var in PROJECT_NAME REPO_ROOT DEPLOY_PATH DEV_BRANCH MAIN_BRANCH INSTALL_DEPS_COMMAND BUILD_COMMAND NODE_VERSION WEB_USER WEB_GROUP BACKUP_PREFIX; do
@@ -245,6 +328,15 @@ for var in PROJECT_NAME REPO_ROOT DEPLOY_PATH DEV_BRANCH MAIN_BRANCH INSTALL_DEP
     exit 1
   fi
 done
+
+if [[ "$PROJECT_TYPE" == "python" ]]; then
+  for var in PYTHON_VERSION SERVICE_NAME SERVICE_PORT SERVICE_USER SERVICE_GROUP HEALTH_PATH REQUIREMENTS_FILE REQUIREMENTS_DEV_FILE REPO_SSH_URL; do
+    if [[ -z "${!var}" ]]; then
+      echo "Error: $var is required for Python projects." >&2
+      exit 1
+    fi
+  done
+fi
 
 mkdir -p "$TARGET/.devops" "$TARGET/.github/workflows"
 
@@ -264,6 +356,9 @@ elif [[ "$PROJECT_TYPE" == "npm" ]] && [[ -d "$TEMPLATE_ROOT/github-npm/workflow
   if [[ -d "$TEMPLATE_ROOT/devops-npm/scripts" ]]; then
     tar -C "$TEMPLATE_ROOT/devops-npm/scripts" -cf - . | tar -C "$TARGET/.devops/scripts" -xf -
   fi
+elif [[ "$PROJECT_TYPE" == "python" ]] && [[ -d "$TEMPLATE_ROOT/github-python/workflows" ]]; then
+  echo "📦 Using Python FastAPI (self-hosted arkserver) GitHub Actions workflows"
+  tar -C "$TEMPLATE_ROOT/github-python/workflows" -cf - . | tar -C "$TARGET/.github/workflows" -xf -
 else
   tar -C "$TEMPLATE_ROOT/github/workflows" -cf - . | tar -C "$TARGET/.github/workflows" -xf -
 fi
@@ -275,6 +370,7 @@ fi
 mapfile -t FILES < <(find "$TARGET/.devops" "$TARGET/.github/workflows" -type f)
 
 export PROJECT_NAME PROJECT_SLUG PROJECT_TYPE REPO_ROOT DEPLOY_PATH SITE_URL DEV_BRANCH MAIN_BRANCH INSTALL_DEPS_COMMAND BUILD_COMMAND NODE_VERSION WEB_USER WEB_GROUP BACKUP_PREFIX STARTER_PATH
+export PYTHON_VERSION SERVICE_NAME SERVICE_PORT SERVICE_USER SERVICE_GROUP HEALTH_PATH REQUIREMENTS_FILE REQUIREMENTS_DEV_FILE REPO_SSH_URL
 
 PLACEHOLDERS_JSON=$(python3 - <<'PY'
 import json, os
@@ -293,7 +389,16 @@ print(json.dumps({
   "WEB_USER": os.environ["WEB_USER"],
   "WEB_GROUP": os.environ["WEB_GROUP"],
   "BACKUP_PREFIX": os.environ["BACKUP_PREFIX"],
-  "STARTER_PATH": os.environ["STARTER_PATH"]
+  "STARTER_PATH": os.environ["STARTER_PATH"],
+  "PYTHON_VERSION": os.environ.get("PYTHON_VERSION", "3.11"),
+  "SERVICE_NAME": os.environ.get("SERVICE_NAME", ""),
+  "SERVICE_PORT": os.environ.get("SERVICE_PORT", ""),
+  "SERVICE_USER": os.environ.get("SERVICE_USER", "alex"),
+  "SERVICE_GROUP": os.environ.get("SERVICE_GROUP", "Developer"),
+  "HEALTH_PATH": os.environ.get("HEALTH_PATH", "/health"),
+  "REQUIREMENTS_FILE": os.environ.get("REQUIREMENTS_FILE", "requirements.txt"),
+  "REQUIREMENTS_DEV_FILE": os.environ.get("REQUIREMENTS_DEV_FILE", "requirements-dev.txt"),
+  "REPO_SSH_URL": os.environ.get("REPO_SSH_URL", "")
 }))
 PY
 )
