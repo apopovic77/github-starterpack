@@ -1,0 +1,23 @@
+name: Dev Branch CI
+
+on:
+  push:
+    branches:
+      - {{DEV_BRANCH}}
+  pull_request:
+    branches:
+      - {{MAIN_BRANCH}}
+
+jobs:
+  test:
+    # Nur der eigene Runner auf arkserver; GitHub-gehostete Runner sind fuer dieses Konto gesperrt.
+    runs-on: [self-hosted, linux, arkserver]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tests
+        run: |
+          python{{PYTHON_VERSION}} -m venv .ci-venv
+          .ci-venv/bin/pip install -q -r {{REQUIREMENTS_DEV_FILE}}
+          .ci-venv/bin/python -m pytest -q

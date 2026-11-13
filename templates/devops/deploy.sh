@@ -51,6 +51,11 @@ fi
 
 echo -e "${YELLOW}🚢 Deploying new build...${NC}"
 mkdir -p "$DEPLOY_PATH"
+# Schutz (#1245): leere oder fehlende dist/ + --delete leert das Ziel samt Laufzeitdaten.
+if [ ! -d "$REPO_PATH/dist" ] || [ -z "$(ls -A "$REPO_PATH/dist")" ]; then
+  echo -e "${RED}❌ ABBRUCH: $REPO_PATH/dist fehlt oder ist leer, rsync --delete wuerde $DEPLOY_PATH leeren.${NC}" >&2
+  exit 1
+fi
 rsync -av --delete "$REPO_PATH/dist/" "$DEPLOY_PATH/"
 
 echo -e "${YELLOW}🔒 Setting permissions...${NC}"

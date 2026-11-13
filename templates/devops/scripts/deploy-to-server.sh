@@ -198,7 +198,8 @@ fi
 echo -e "${YELLOW}🚢 Deploying files...${NC}"
 
 if [ "$SERVER_TYPE" = "python-api" ]; then
-    # Python API: rsync all files except venv
+    # Python API: rsync all files except venv. Laufzeitdaten im Ziel (.env, data/, SQLite)
+    # sind ausgenommen: --delete loescht sonst alles, was nicht im Repo liegt (#1245).
     rsync -az --delete \
         --exclude='venv' \
         --exclude='.git' \
@@ -206,6 +207,11 @@ if [ "$SERVER_TYPE" = "python-api" ]; then
         --exclude='*.pyc' \
         --exclude='node_modules' \
         --exclude='.env.local' \
+        --exclude='.env' \
+        --exclude='data/' \
+        --exclude='*.db' \
+        --exclude='*.db-wal' \
+        --exclude='*.db-shm' \
         "$REPO_ROOT/" "$SERVER_USER@$SERVER_HOST:$DEPLOY_PATH/"
 
     # Update dependencies if requirements.txt changed
@@ -228,6 +234,11 @@ else
         --exclude='.git' \
         --exclude='node_modules' \
         --exclude='.env.local' \
+        --exclude='.env' \
+        --exclude='data/' \
+        --exclude='*.db' \
+        --exclude='*.db-wal' \
+        --exclude='*.db-shm' \
         "$REPO_ROOT/" "$SERVER_USER@$SERVER_HOST:$DEPLOY_PATH/"
 fi
 
