@@ -265,7 +265,15 @@ fi
 
 # Set permissions
 echo -e "${YELLOW}🔒 Setting permissions...${NC}"
-ssh "$SERVER_USER@$SERVER_HOST" "chown -R www-data:www-data '$DEPLOY_PATH' && chmod -R 755 '$DEPLOY_PATH'"
+# #3251: nicht mehr chmod -R 755 (machte jede .env fuer alle lesbar). Ordner 755, Dateien
+# lesbar ohne Schreibrecht fuer andere; Geheimnisdateien 640 fuer Eigentuemer und Dienstgruppe.
+ssh "$SERVER_USER@$SERVER_HOST" bash -s << EOF
+$(cat "$SCRIPT_DIR/geheim-schuetzen.sh")
+set -e
+chown -R www-data:www-data '$DEPLOY_PATH'
+rechte_setzen '$DEPLOY_PATH'
+geheim_schuetzen '$DEPLOY_PATH' "\$(systemctl show -p User --value '$SERVICE_NAME' 2>/dev/null || true)"
+EOF
 
 # Health check
 echo ""

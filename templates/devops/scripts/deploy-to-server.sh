@@ -185,8 +185,10 @@ if [ "$SKIP_BACKUP" = false ] && [ "$BACKUP_ENABLED" = "true" ]; then
 
     if ssh "$SERVER_USER@$SERVER_HOST" "[ -d '$DEPLOY_PATH' ]" 2>/dev/null; then
         ssh "$SERVER_USER@$SERVER_HOST" bash << EOF
+$(cat "$SCRIPT_DIR/geheim-schuetzen.sh")
 mkdir -p "$BACKUP_DIR"
 cp -r "$DEPLOY_PATH" "$BACKUP_PATH"
+geheim_schuetzen "$BACKUP_PATH"
 EOF
         echo -e "${GREEN}✅ Backup created: $BACKUP_PATH${NC}"
     else
@@ -246,7 +248,15 @@ echo -e "${GREEN}✅ Files deployed${NC}"
 
 # Set permissions
 echo -e "${YELLOW}🔒 Setting permissions...${NC}"
-ssh "$SERVER_USER@$SERVER_HOST" "chown -R www-data:www-data '$DEPLOY_PATH' && chmod -R 755 '$DEPLOY_PATH'"
+# #3251: nicht mehr chmod -R 755 (machte jede .env fuer alle lesbar). Ordner 755, Dateien
+# lesbar ohne Schreibrecht fuer andere; Geheimnisdateien 640 fuer Eigentuemer und Dienstgruppe.
+ssh "$SERVER_USER@$SERVER_HOST" bash -s << EOF
+$(cat "$SCRIPT_DIR/geheim-schuetzen.sh")
+set -e
+chown -R www-data:www-data '$DEPLOY_PATH'
+rechte_setzen '$DEPLOY_PATH'
+geheim_schuetzen '$DEPLOY_PATH' "\$(systemctl show -p User --value '$SERVICE_NAME' 2>/dev/null || true)"
+EOF
 
 # Restart service
 echo -e "${YELLOW}🔄 Restarting service...${NC}"
