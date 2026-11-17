@@ -15,8 +15,9 @@ fail() { echo "FEHLER: $*" >&2; FEHLER=1; }
 ok() { echo "ok: $*"; }
 
 # --- 1. kein aktives chmod -R 755 -------------------------------------------------
-if grep -rnE '^[^#]*chmod -R 755' "$ROOT/templates" >/dev/null; then
-  grep -rnE '^[^#]*chmod -R 755' "$ROOT/templates" >&2
+# Nur Skripte und Workflows: Doku darf den alten Befehl nennen.
+if grep -rnE --include='*.sh' --include='*.yml' --include='*.yaml' '^[^#]*chmod -R 755' "$ROOT/templates" >/dev/null; then
+  grep -rnE --include='*.sh' --include='*.yml' --include='*.yaml' '^[^#]*chmod -R 755' "$ROOT/templates" >&2
   fail "chmod -R 755 steht noch in den Vorlagen"
 else
   ok "kein chmod -R 755 in templates/"
