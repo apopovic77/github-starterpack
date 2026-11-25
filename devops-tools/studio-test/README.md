@@ -89,7 +89,8 @@ auf. Dann baut studio-ci ohne Vorgabe und schreibt einen Hinweis in die Ausgabe.
   unter `~/ci/cache/venv/`. Gibt es eine `requirements.lock`, wird sie statt `requirements.txt` installiert.
   `pytest` und `pytest-xdist` sind immer dabei.
 - **Node:** `npm ci` je Hash von `package.json` und `package-lock.json` unter `~/ci/cache/node/`.
-  Der Arbeitsbereich bekommt einen APFS-Klon (`cp -c`), sofort und ohne Platzbedarf.
+  Der Arbeitsbereich bekommt einen APFS-Klon (`cp -c`), sofort und ohne Platzbedarf. Lokale
+  `file:`-Abhängigkeiten (etwa `vendor/*.tgz`) kommen mit und zählen zum Cache-Schlüssel.
 - `studio-ci aufraeumen` löscht Läufe nach 7 Tagen sowie Caches und Arbeitsbereiche nach 14 Tagen
   ohne Nutzung.
 
