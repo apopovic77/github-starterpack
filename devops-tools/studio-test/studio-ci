@@ -459,12 +459,14 @@ class Tee:
 def execute(run_id, meta, root, workdir, setup, command, timeout, wait_max, out):
     slot_fh, slot, waited = take_slot(out, wait_max)
     rc = 1
+    # Eigenes TMPDIR je Lauf: Parallele Läufe teilen sich sonst z. B. $TMPDIR/daten (cloud-api).
+    run_tmp = CI / "tmp" / run_id
     try:
         with Lock(root.parent / f"{root.name}.lock"):
             log(out, f"Lauf {run_id} · Platz {slot}/{MAX_SLOTS} · wartete {waited:.0f} s")
             env = {"HOME": str(HOME), "LANG": "en_US.UTF-8", "CI": "1", "STUDIO_CI": "1",
-                   "TMPDIR": str(CI / "tmp"), "PATH": BREW_PATH}
-            (CI / "tmp").mkdir(exist_ok=True)
+                   "TMPDIR": str(run_tmp), "PATH": BREW_PATH}
+            run_tmp.mkdir(parents=True, exist_ok=True, mode=0o700)
             if setup == "python":
                 extra = repo_conf(root).get("TEST_PIP", "").split()
                 bad = [x for x in extra if not PIP_SPEC_RE.match(x)]
@@ -506,6 +508,7 @@ def execute(run_id, meta, root, workdir, setup, command, timeout, wait_max, out)
         rc = e.code if isinstance(e.code, int) else 1
     finally:
         slot_fh.close()
+        shutil.rmtree(run_tmp, ignore_errors=True)
         meta.update({"status": "fertig", "rc": rc, "ende": time.time()})
         (RUNS / f"{run_id}.json").write_text(json.dumps(meta))
     return rc
