@@ -572,6 +572,10 @@ def execute(run_id, meta, root, workdir, setup, command, timeout, wait_max, out,
                 env.update(prepare_node(workdir, out))
             build_git_index(root, out)
             raise_nofile(out)
+            # Eigenes Home je Lauf: Das echte Home gehört root, und Tests sollen ohnehin kein fremdes
+            # Home verändern (cloud-api schreibt nach ~/.cloud-api-bots). Abhängigkeiten sind schon bereit.
+            (run_tmp / "home").mkdir(mode=0o700)
+            env["HOME"] = str(run_tmp / "home")
             t0 = time.time()
             if teile > 1:
                 parts = split_files(root, workdir, teile, out)
