@@ -41,6 +41,8 @@ MAX_TIMEOUT = 30 * 60
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
 RUN_RE = re.compile(r"^[0-9]{8}-[0-9]{6}-[0-9a-f]{6}$")
 REL_RE = re.compile(r"^(?!/)(?!.*\.\.)[A-Za-z0-9._/-]{0,200}$")
+GLOB_RE = re.compile(r"^(?!/)(?!.*\.\.)[A-Za-z0-9._/*?\[\]-]{1,200}$")
+TEILE_RE = re.compile(r"^teile=([1-9]|1[0-6])$")
 PY_CANDIDATES = ["/opt/homebrew/bin/python3.13", "/opt/homebrew/bin/python3", "/usr/bin/python3"]
 RSYNC_CANDIDATES = ["/opt/homebrew/bin/rsync", "/usr/bin/rsync"]
 BREW_PATH = "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
@@ -420,11 +422,17 @@ def take_slot(out, wait_max):
 # --------------------------------------------------------------------------- Befehle
 
 def cmd_run(args, from_gate):
-    """run <arbeitsbereich> <unterordner|.> <setup> <timeout> <wartezeit> <detach 0|1> -- <befehl…>"""
+    """run <arbeitsbereich> <unterordner|.> <setup> <timeout> <wartezeit> <detach 0|1> [teile=N] -- <befehl…>"""
     if "--" not in args:
         die("run: -- fehlt")
     i = args.index("--")
     head, command = args[:i], args[i + 1:]
+    teile = 1
+    if len(head) == 7:
+        m = TEILE_RE.match(head.pop())
+        if not m:
+            die("run: teile=1..16")
+        teile = int(m.group(1))
     if len(head) != 6 or not command:
         die("run: Argumente")
     ws, sub, setup, timeout, wait_max, detach = head
@@ -438,7 +446,8 @@ def cmd_run(args, from_gate):
     if not str(workdir).startswith(str(root.resolve())) or not workdir.is_dir():
         die(f"run: Ordner {sub} fehlt im Arbeitsbereich")
     run_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
-    meta = {"id": run_id, "ws": ws, "sub": sub, "cmd": command, "start": time.time(), "status": "läuft"}
+    meta = {"id": run_id, "ws": ws, "sub": sub, "cmd": command, "teile": teile, "start": time.time(),
+            "status": "läuft"}
     (RUNS / f"{run_id}.json").write_text(json.dumps(meta))
     if detach == "1":
         pid = os.fork()
@@ -454,7 +463,7 @@ def cmd_run(args, from_gate):
         out = sys.stdout
     else:
         out = Tee(sys.stdout, open(RUNS / f"{run_id}.log", "w", buffering=1))
-    rc = execute(run_id, meta, root, workdir, setup, command, timeout, wait_max, out)
+    rc = execute(run_id, meta, root, workdir, setup, command, timeout, wait_max, out, teile)
     if detach == "1":
         os._exit(rc)
     return rc
@@ -476,7 +485,71 @@ class Tee:
         return self.s[0].fileno()
 
 
-def execute(run_id, meta, root, workdir, setup, command, timeout, wait_max, out):
+def split_files(root: Path, workdir: Path, teile: int, out):
+    """Testdateien sortiert reihum auf die Teile (wie release.yml #3718: bekannte Reihenfolge bleibt je Teil)."""
+    muster = repo_conf(root).get("TEST_DATEIEN", "tests/test_*.py").split()
+    bad = [m for m in muster if not GLOB_RE.match(m)]
+    if bad or not muster:
+        log(out, f"TEST_DATEIEN: ungültiges Muster {bad[0] if bad else ''!r}")
+        raise SystemExit(2)
+    wr = workdir.resolve()
+    files = sorted({str(f.relative_to(workdir)) for m in muster for f in workdir.glob(m)
+                    if f.is_file() and str(f.resolve()).startswith(str(wr) + "/")})
+    if not files:
+        log(out, f"TEST_DATEIEN: keine Datei für {' '.join(muster)}")
+        raise SystemExit(2)
+    return [files[k::teile] for k in range(teile) if files[k::teile]]
+
+
+def run_parts(run_id, workdir, command, env, run_tmp, parts, timeout, out):
+    """Startet je Teil einen Prozess mit eigenem TMPDIR und Log. rc 0 nur, wenn alle Teile 0 liefern."""
+    t0 = time.time()
+    procs = []
+    for k, files in enumerate(parts, 1):
+        tdir = run_tmp / f"teil{k}"
+        tdir.mkdir(mode=0o700)
+        logf = open(RUNS / f"{run_id}.teil{k}.log", "wb")
+        p = subprocess.Popen(["/usr/bin/nice", "-n", str(NICE)] + command + files, cwd=workdir,
+                             env={**env, "TMPDIR": str(tdir), "STUDIO_TEIL": str(k)}, stdout=logf,
+                             stderr=subprocess.STDOUT, start_new_session=True)
+        procs.append((k, p, logf, len(files)))
+    log(out, f"{len(parts)} Teile gestartet ({sum(n for *_, n in procs)} Dateien)")
+    deadline = t0 + timeout
+    rcs = {}
+    while len(rcs) < len(procs):
+        for k, p, logf, n in procs:
+            if k in rcs or p.poll() is None:
+                continue
+            rcs[k] = p.returncode
+            logf.close()
+            text = (RUNS / f"{run_id}.teil{k}.log").read_text(errors="replace").splitlines()
+            wichtig = [x for x in text if x.startswith(("FAILED", "ERROR"))][:50]
+            log(out, f"Teil {k}/{len(procs)} rc={p.returncode} nach {time.time() - t0:.0f} s ({n} Dateien)")
+            for x in wichtig + text[-1:]:
+                out.write(f"  [{k}] {x}\n")
+            out.flush()
+        if len(rcs) < len(procs) and time.time() > deadline:
+            for k, p, logf, n in procs:
+                if k not in rcs:
+                    for sig in (signal.SIGTERM, signal.SIGKILL):
+                        try:
+                            os.killpg(p.pid, sig)
+                            p.wait(timeout=5)
+                            break
+                        except ProcessLookupError:
+                            break
+                        except subprocess.TimeoutExpired:
+                            continue
+                    rcs[k] = 124
+                    logf.close()
+            log(out, f"Zeitlimit {timeout} s überschritten, abgebrochen")
+            return 124
+        time.sleep(0.5)
+    bad = [rc for rc in rcs.values() if rc != 0]
+    return bad[0] if bad else 0
+
+
+def execute(run_id, meta, root, workdir, setup, command, timeout, wait_max, out, teile=1):
     slot_fh, slot, waited = take_slot(out, wait_max)
     rc = 1
     # Eigenes TMPDIR je Lauf: Parallele Läufe teilen sich sonst z. B. $TMPDIR/daten (cloud-api).
@@ -500,6 +573,11 @@ def execute(run_id, meta, root, workdir, setup, command, timeout, wait_max, out)
             build_git_index(root, out)
             raise_nofile(out)
             t0 = time.time()
+            if teile > 1:
+                parts = split_files(root, workdir, teile, out)
+                rc = run_parts(run_id, workdir, command, env, run_tmp, parts, timeout, out)
+                log(out, f"Ende rc={rc} nach {time.time() - t0:.1f} s")
+                return rc
             p = subprocess.Popen(["/usr/bin/nice", "-n", str(NICE)] + command, cwd=workdir, env=env,
                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
             def pump():
@@ -551,6 +629,8 @@ def cmd_log(args):
     if not p.is_file():
         die("kein Log", 3)
     sys.stdout.write(p.read_text(errors="replace"))
+    for t in sorted(RUNS.glob(f"{args[0]}.teil*.log"), key=lambda x: int(x.name.rsplit("teil", 1)[1][:-4])):
+        sys.stdout.write(f"\n===== {t.name} =====\n" + t.read_text(errors="replace"))
     return 0
 
 

@@ -18,10 +18,11 @@ sequenceDiagram
   C-->>A: wie lokal, Log unter ~/.cache/studio-test/
 ```
 
-**Wofür, und wofür nicht:** `studio-test` ist für schnelle Rückmeldung beim Entwickeln da. Sein
-Ergebnis entscheidet nie über `main` oder ein Release. Die Suite des Release-Takts läuft weiter auf den
-Runnern am Kern. Grund: Bauen und Testen laufen auf studio unter demselben Benutzer, ein Test kann
-die geteilten Caches verändern und einem späteren Lauf ein falsches Grün liefern.
+**Wofür, und wofür nicht:** Ein Lauf, den ein Agent startet (Benutzer `agentos-ci`), ist schnelle
+Rückmeldung beim Entwickeln und entscheidet nie über `main` oder ein Release. Grund: Alle Agenten bauen und
+testen dort unter demselben Benutzer, ein Test kann die geteilten Caches verändern und einem späteren Lauf
+ein falsches Grün liefern. Die Release-Pipeline nimmt deshalb einen eigenen Benutzer (`agentos-release`,
+siehe unten), den nur der Runner erreicht. Dessen Exit-Code ist ein Pipeline-Ergebnis.
 
 ### Benutzung
 
@@ -49,6 +50,26 @@ TEST_CMD=python -m pytest -q -n 8
 TEST_PIP=pytest-asyncio==1.3.0 greenlet
 TEST_WAIT=600
 ```
+
+### Aufteilen (große Suiten)
+
+```ini
+TEST_TEILE=6
+TEST_DATEIEN=tests/test_*.py
+```
+
+- Die Dateien aus `TEST_DATEIEN` (Muster relativ zu `TEST_DIR`, mehrere durch Leerzeichen) gehen sortiert
+  reihum auf `TEST_TEILE` Prozesse, wie in `release.yml` von cloud-api (#3718). Bekannte
+  Reihenfolge-Abhängigkeiten bleiben je Teil erhalten.
+- Jeder Teil bekommt ein eigenes `TMPDIR` und `STUDIO_TEIL=<n>`. Wer Daten nach `$TMPDIR` schreibt (wie
+  cloud-api mit `CLOUD_API_DATA_DIR`), ist damit je Teil getrennt.
+- Rückgabewert 0 nur, wenn alle Teile 0 liefern. Die Ausgabe zeigt je Teil `FAILED`/`ERROR` und die letzte
+  Zeile, `studio-test log <id>` die vollen Logs aller Teile.
+- Für einen Lauf: `--teile N`. Steht unter den Testargumenten ein Pfad (`-- tests/test_x.py`), wird nicht
+  aufgeteilt.
+- Beim Rückfall auf arkserver wird genauso aufgeteilt, die CPU-Quote je Teil entsprechend kleiner.
+- `pytest -n` (xdist) ist kein Ersatz: Bei cloud-api sammeln die Worker verschiedene Testlisten und
+  brechen ab.
 
 `TEST_PIP` sind zusätzliche Pakete für die Python-Umgebung auf studio. Erlaubt sind nur Paketnamen,
 optional mit Extras und Versionsangabe, keine Optionen, URLs oder Pfade. Sie fließen in den
@@ -131,6 +152,42 @@ Host studio-ci
   IdentityFile ~/.ssh/studio_ci_ed25519
   IdentitiesOnly yes
 ```
+
+### Pipeline-Benutzer `agentos-release` (Release-Suite)
+
+Für Ergebnisse, die über `main` entscheiden, gilt `agentos-ci` nicht (gemeinsame Caches der Agenten). Die
+Pipeline nimmt einen eigenen Benutzer auf studio mit demselben `studio-ci`:
+
+- **studio:** Benutzer `agentos-release`, eingerichtet wie `agentos-ci` (Punkte 1 bis 4 oben), eigene
+  `authorized_keys` mit dem Schlüssel des Runners. `studio-ci` rechnet mit `Path.home()`, Caches und
+  Arbeitsbereiche liegen getrennt unter `~agentos-release/ci`. Kein gegenseitiger Lesezugriff.
+- **Runner auf arkserver** (`github-runner`): Schlüssel `~/.ssh/studio_release`. Der Sprung über arkturian
+  nimmt das vorhandene Konto `studio-deploy` (darf nur nach `127.0.0.1:3342`), nie einen Schlüssel von alex.
+  `~github-runner/.ssh/config`:
+
+  ```
+  Host studio-release
+    HostName localhost
+    Port 3342
+    User agentos-release
+    IdentityFile ~/.ssh/studio_release
+    IdentitiesOnly yes
+    HostKeyAlias studio
+    ProxyCommand ssh -i ~/.ssh/studio_deploy -o IdentitiesOnly=yes -o BatchMode=yes -W 127.0.0.1:3342 studio-deploy@arkturian.com
+  ```
+
+- **Im Workflow:** derselbe Client, nur Host und Name des Arbeitsbereichs gesetzt:
+
+  ```yaml
+  - name: Suite auf studio
+    env:
+      STUDIO_TEST_HOST: studio-release
+      AGENT_NAME: release
+    run: studio-test --teile 6 -- --tb=no -rfE
+  ```
+
+  Der Exit-Code ist das Ergebnis. Ist studio nicht erreichbar (rc 255) oder voll (75), rechnet der Runner
+  den Lauf selbst, ebenso aufgeteilt.
 
 ### Git im Arbeitsbereich
 
