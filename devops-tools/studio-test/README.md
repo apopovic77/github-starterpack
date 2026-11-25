@@ -71,7 +71,8 @@ Ohne Datei: `requirements.txt` ergibt Python mit `python -m pytest -q`, eine `pa
 
 ### Caches auf studio
 
-- **Python:** venv je Hash der `requirements*.txt` und der Python-Version unter `~/ci/cache/venv/`.
+- **Python:** venv je Hash von `requirements.lock`, `requirements*.txt`, `TEST_PIP` und der Python-Version
+  unter `~/ci/cache/venv/`. Gibt es eine `requirements.lock`, wird sie statt `requirements.txt` installiert.
   `pytest` und `pytest-xdist` sind immer dabei.
 - **Node:** `npm ci` je Hash von `package.json` und `package-lock.json` unter `~/ci/cache/node/`.
   Der Arbeitsbereich bekommt einen APFS-Klon (`cp -c`), sofort und ohne Platzbedarf.
