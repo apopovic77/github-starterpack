@@ -52,6 +52,20 @@ Cache-Schlüssel ein.
 Ohne Datei: `requirements.txt` ergibt Python mit `python -m pytest -q`, eine `package.json` mit
 `test`-Skript ergibt Node mit `npm test --`.
 
+### Abgleich mit Produktion (Python)
+
+Gibt es auf arkserver eine Produktions-venv des Repos (`/var/www/<repo>/venv`, `.venv` oder
+`/var/www/<repo>.arkturian.com/venv`; der Name kommt aus der Adresse von `origin`), schickt
+`studio-test` ihre Python-Version und ihre Paketversionen als `.studio-test/` mit. studio-ci baut die
+Umgebung dann mit derselben Python-Version (falls auf studio vorhanden) und den Versionen als
+`pip -c`-Vorgabe. Braucht der Arbeitsstand neuere Pakete als Produktion, löst pip die Vorgabe nicht
+auf. Dann baut studio-ci ohne Vorgabe und schreibt einen Hinweis in die Ausgabe.
+
+- `TEST_PROD_VENV=/pfad/zur/venv` nimmt eine bestimmte venv, `TEST_PROD_VENV=aus` schaltet den
+  Abgleich ab.
+- Liegt die Produktion nicht auf arkserver, gehören die Versionen als `requirements.lock` ins Repo.
+  Das ist ohnehin der gründlichere Weg.
+
 ### Testabhängigkeiten
 
 - **Python:** `pytest` und `pytest-xdist` sind immer dabei. Was die Tests sonst brauchen, etwa
@@ -65,7 +79,7 @@ Ohne Datei: `requirements.txt` ergibt Python mit `python -m pytest -q`, eine `pa
 
 ### Was nie mitgeht
 
-`.git`, `node_modules`, `.venv`, `venv`, `.env*`, `*.key`, `*.pem`, `*.p12`, `secrets/`,
+`.git` (auch als Datei in einem git worktree), `node_modules`, `.venv`, `venv`, `.env*`, `*.key`, `*.pem`, `*.p12`, `secrets/`,
 `.secrets/`, `.npmrc`, `.pypirc`, `*.db`, `*.sqlite*`, `dist/`, `build/` sowie alles aus
 `.gitignore`. Dateien über 50 MB werden nicht übertragen. Tests müssen ohne Zugangsdaten laufen.
 
