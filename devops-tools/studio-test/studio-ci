@@ -327,15 +327,21 @@ def build_git_index(root: Path, out):
             continue
         if (rootr / rel).is_file() or (rootr / rel).is_symlink():
             keep.append(raw)
-    env = {"HOME": str(HOME), "PATH": BREW_PATH, "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0"}
+    # Keine Konfiguration von außen: System, ~/.gitconfig und ~/.config/git (für agentos-ci beschreibbar).
+    env = {"HOME": str(HOME), "PATH": BREW_PATH, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
+           "XDG_CONFIG_HOME": str(CI / "tmp" / "kein-xdg"), "GIT_TERMINAL_PROMPT": "0"}
     gd = root / ".git"
-    if not (gd / "HEAD").exists():
-        subprocess.run([git, "init", "-q", str(root)], env=env, check=False)
-    (gd / "index").unlink(missing_ok=True)
+    # Je Lauf frisch: Ein Test des vorigen Laufs könnte in .git/config fsmonitor, Filter oder Hooks gesetzt
+    # haben, die der nächste git add sonst ausführt (Hinweis Cloud-Operator).
+    shutil.rmtree(gd, ignore_errors=True)
+    if gd.exists() or gd.is_symlink():
+        (gd.unlink() if gd.is_symlink() or gd.is_file() else None)
+    subprocess.run([git, "init", "-q", str(root)], env=env, check=False)
     pf = gd / "studio-ci-pathspec"
     pf.write_bytes(b"\0".join(keep))
     t0 = time.time()
-    rc = subprocess.run([git, "-C", str(root), "-c", "core.hooksPath=/dev/null", "add", "-f",
+    rc = subprocess.run([git, "-C", str(root), "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+                         "-c", "core.untrackedCache=false", "add", "-f",
                          "--pathspec-from-file", str(pf), "--pathspec-file-nul"],
                         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE).returncode
     if rc != 0:
