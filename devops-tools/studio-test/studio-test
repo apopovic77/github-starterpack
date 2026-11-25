@@ -14,6 +14,8 @@ Optionen:
     --dir D         Unterordner für diesen Lauf (statt TEST_DIR)
     --setup S       python|node|none für diesen Lauf (statt TEST_SETUP)
     --teile N       Testdateien auf N parallele Prozesse verteilen (statt TEST_TEILE, 1 bis 16)
+    --prod-venv P   venv der Produktion für den Abgleich, "aus" schaltet ihn ab (statt TEST_PROD_VENV)
+    --streng        Release-Tor: Pakete genau wie in Produktion, sonst Fehler (rc 3) statt Weiterbau
     -n, --dry-run   nur zeigen, was geschickt und ausgeführt würde
 
 Konfiguration je Repo in .devops/studio-test.conf (Zeilen KEY=Wert, alles optional):
@@ -126,6 +128,7 @@ def load_conf(root: Path, over=None):
         sys.exit("studio-test: TEST_TEILE muss 1 bis 16 sein")
     return {"sub": sub, "setup": setup, "cmd": shlex.split(cmd), "wait": int(conf.get("TEST_WAIT", "600")),
             "prod_venv": conf.get("TEST_PROD_VENV", ""), "teile": teile,
+            "streng": conf.get("TEST_STRENG", "") == "1",
             "dateien": conf.get("TEST_DATEIEN", "tests/test_*.py").split()}
 
 
@@ -167,6 +170,11 @@ def abgleich_dir(root: Path, ws: str, conf) -> Path:
     d.mkdir(parents=True, exist_ok=True)
     for f in ("python", "constraints.txt"):
         (d / f).write_text("")
+    streng = d / "streng"
+    if conf.get("streng"):
+        streng.write_text("1")
+    else:
+        streng.unlink(missing_ok=True)
     # Versionierte Dateien (NUL-getrennt): studio-ci baut daraus einen Git-Index ohne Verlauf, damit
     # Tests mit `git ls-files` laufen. .git selbst geht nie mit.
     try:
@@ -226,6 +234,16 @@ def sync(root: Path, ws: str, dry, extra_src: Path = None):
     t0 = time.time()
     rc = subprocess.run(args).returncode
     return rc, time.time() - t0
+
+
+def fallback(root: Path, conf, extra, timeout, rc, grund):
+    """Rückfall auf arkserver. Im strengen Modus nicht: Die lokale Umgebung ist nicht die geprüfte, der
+    Aufrufer (Pipeline) bekommt rc 255 bzw. 75 und rechnet selbst mit seiner eigenen Umgebung."""
+    if conf.get("streng"):
+        say(f"{grund}, streng: kein Rückfall, rc={rc}")
+        return rc
+    say(f"{grund}, Rückfall auf arkserver")
+    return run_local(root, conf, extra, timeout)
 
 
 def run_local(root: Path, conf, extra, timeout):
@@ -320,6 +338,10 @@ def main():
             over["TEST_SETUP"] = next(it)
         elif a == "--teile":
             over["TEST_TEILE"] = next(it)
+        elif a == "--prod-venv":
+            over["TEST_PROD_VENV"] = next(it)
+        elif a == "--streng":
+            over["TEST_STRENG"] = "1"
         else:
             sys.exit(f"studio-test: unbekannte Option {a} (Testargumente nach --)")
     root = repo_root()
@@ -342,8 +364,7 @@ def main():
         say(f"würde ausführen in {conf['sub']} ({conf['setup']}): {' '.join(conf['cmd'] + extra)}")
         return rc
     if rc == 255:  # nur ssh nicht erreichbar; rc 12 (z. B. Gate lehnt ab) ist ein Fehler, kein Rückfall
-        say(f"studio nicht erreichbar (rsync rc={rc}), Rückfall auf arkserver")
-        return run_local(root, conf, extra, timeout)
+        return fallback(root, conf, extra, timeout, rc, f"studio nicht erreichbar (rsync rc={rc})")
     if rc != 0:
         say(f"Abgleich fehlgeschlagen (rsync rc={rc})")
         return rc
@@ -376,11 +397,9 @@ def main():
             logf.write(s)
         rc = p.wait()
     if rc == FALLBACK_RC:
-        say("studio voll belegt, Rückfall auf arkserver")
-        return run_local(root, conf, extra, timeout)
+        return fallback(root, conf, extra, timeout, rc, "studio voll belegt")
     if rc == 255:
-        say("Verbindung zu studio abgebrochen, Rückfall auf arkserver")
-        return run_local(root, conf, extra, timeout)
+        return fallback(root, conf, extra, timeout, rc, "Verbindung zu studio abgebrochen")
     say(f"rc={rc} · gesamt {time.time() - t0 + dt:.1f} s · Log {logpath}")
     return rc
 
