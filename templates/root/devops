@@ -16,6 +16,7 @@ Commands:
   release [options]     Run release.sh
   update [options]      Sync DevOps templates (update-devops.sh)
   rollback              Launch rollback.sh (interactive)
+  test [opts] [-- args] Tests auf studio statt auf arkserver (studio-test, #3999)
 
 Pass additional arguments after the command.
 USAGE
@@ -51,6 +52,13 @@ case "$cmd" in
     ;;
   rollback)
     "$REPO_ROOT/.devops/rollback.sh" "$@"
+    ;;
+  test)
+    if ! command -v studio-test >/dev/null 2>&1; then
+      echo "Error: studio-test fehlt (devops-tools/studio-test/README.md)." >&2
+      exit 1
+    fi
+    cd "$REPO_ROOT" && exec studio-test "$@"
     ;;
   -h|--help|help)
     usage

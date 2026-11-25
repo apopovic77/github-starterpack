@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+"""studio-ci: Empfangsseite von `studio-test` auf studio (Benutzer agentos-ci). Issue #3999.
+
+Aufruf nur über den Zwangsbefehl in authorized_keys:
+    command="/Users/agentos-ci/bin/studio-ci gate",no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty ssh-ed25519 …
+
+Das Gate erlaubt genau zwei Dinge:
+  1. rsync als Empfänger in ~/ci/ws/<arbeitsbereich>/ (keine Pfadoptionen, kein Senden)
+  2. studio-ci <run|status|log|ping> mit geprüften Argumenten
+
+Grenze: Tests führen beliebigen Code des Repos aus, also auch Code als agentos-ci. Das Gate
+verhindert Shell, Portweiterleitung und Pfade außerhalb von ~/ci. Die Trennung zu allem anderen auf
+studio leistet der Benutzer agentos-ci selbst (kein Admin, kein Zugriff auf fremde Bereiche).
+authorized_keys und dieses Skript gehören deshalb root und sind für agentos-ci nicht schreibbar.
+"""
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from pathlib import Path
+
+HOME = Path.home()
+CI = HOME / "ci"
+WS = CI / "ws"
+CACHE = CI / "cache"
+RUNS = CI / "runs"
+SLOTS = CI / "slots"
+MAX_SLOTS = int(os.environ.get("STUDIO_CI_SLOTS", "3"))
+NICE = int(os.environ.get("STUDIO_CI_NICE", "10"))
+MAX_TIMEOUT = 30 * 60
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
+RUN_RE = re.compile(r"^[0-9]{8}-[0-9]{6}-[0-9a-f]{6}$")
+REL_RE = re.compile(r"^(?!/)(?!.*\.\.)[A-Za-z0-9._/-]{0,200}$")
+PY_CANDIDATES = ["/opt/homebrew/bin/python3.13", "/opt/homebrew/bin/python3", "/usr/bin/python3"]
+RSYNC_CANDIDATES = ["/opt/homebrew/bin/rsync", "/usr/bin/rsync"]
+BREW_PATH = "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+
+def die(msg, code=2):
+    sys.stderr.write(f"studio-ci: {msg}\n")
+    sys.exit(code)
+
+
+def first_existing(paths):
+    for p in paths:
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def ensure_dirs():
+    for d in (WS, CACHE / "venv", CACHE / "node", RUNS, SLOTS):
+        d.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+
+# --------------------------------------------------------------------------- Gate
+
+RSYNC_OK_LONG = {"--server", "--delete", "--delete-during", "--delete-after", "--delete-delay",
+                 "--ignore-errors", "--numeric-ids", "--safe-links", "--no-implied-dirs"}
+RSYNC_OK_VALUE = re.compile(r"^--(max-size|timeout|modify-window)=[0-9]+[kKmMgG]?$")
+
+
+def gate():
+    raw = os.environ.get("SSH_ORIGINAL_COMMAND", "").strip()
+    if not raw:
+        die("keine interaktive Sitzung", 1)
+    try:
+        argv = shlex.split(raw)
+    except ValueError:
+        die("Befehl nicht lesbar")
+    if argv and argv[0] in ("rsync", "/usr/bin/rsync", "/opt/homebrew/bin/rsync"):
+        gate_rsync(argv[1:])
+    elif argv and argv[0] in ("studio-ci", str(Path(__file__).resolve())):
+        sys.exit(main(argv[1:], from_gate=True) or 0)
+    else:
+        die("nicht erlaubt: " + (argv[0] if argv else ""))
+
+
+def gate_rsync(args):
+    if "--server" not in args or "--sender" in args:
+        die("rsync nur als Empfänger")
+    # Letztes Argument ist das Ziel, davor steht ".".
+    if len(args) < 3 or args[-2] != ".":
+        die("rsync: unerwartete Argumente")
+    dest = args[-1].rstrip("/")
+    m = re.fullmatch(r"ws/([A-Za-z0-9][A-Za-z0-9._-]{0,80})", dest)
+    if not m:
+        die("rsync: Ziel nur ws/<arbeitsbereich>")
+    for a in args[:-2]:
+        if a in RSYNC_OK_LONG or RSYNC_OK_VALUE.match(a):
+            continue
+        # Kurzoptionen im Server-Modus, z. B. -logDtprze.iLsfxCIvu (nach "e." folgen Fähigkeiten, kein Pfad).
+        if re.fullmatch(r"-[A-Za-z]+(\.[A-Za-z]*)?", a):
+            continue
+        die(f"rsync: Option nicht erlaubt: {a}")
+    ensure_dirs()
+    (WS / m.group(1)).mkdir(exist_ok=True, mode=0o700)
+    rsync = first_existing(RSYNC_CANDIDATES)
+    os.chdir(CI)
+    os.execv(rsync, [rsync] + args[:-1] + [dest + "/"])
+
+
+# --------------------------------------------------------------------------- Umgebung
+
+def sha_files(base: Path, names):
+    h = hashlib.sha256()
+    for n in names:
+        p = base / n
+        if p.is_file():
+            h.update(n.encode() + b"\0" + p.read_bytes() + b"\0")
+    return h.hexdigest()[:16]
+
+
+class Lock:
+    def __init__(self, path: Path):
+        self.path = path
+        self.fh = None
+
+    def __enter__(self):
+        self.fh = open(self.path, "w")
+        fcntl.flock(self.fh, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *a):
+        fcntl.flock(self.fh, fcntl.LOCK_UN)
+        self.fh.close()
+
+
+def log(out, msg):
+    out.write(f"studio-ci: {msg}\n")
+    out.flush()
+
+
+def prepare_python(workdir: Path, req_files, out):
+    py = first_existing(PY_CANDIDATES)
+    ver = subprocess.run([py, "-c", "import sys;print('%d.%d'%sys.version_info[:2])"],
+                         capture_output=True, text=True).stdout.strip()
+    present = [r for r in req_files if (workdir / r).is_file()]
+    key = f"py{ver}-" + sha_files(workdir, present)
+    venv = CACHE / "venv" / key
+    with Lock(CACHE / "venv" / f"{key}.lock"):
+        if not (venv / ".fertig").exists():
+            t0 = time.time()
+            log(out, f"neue Python-Umgebung {key} (einmalig je Abhängigkeitsstand)")
+            shutil.rmtree(venv, ignore_errors=True)
+            subprocess.run([py, "-m", "venv", str(venv)], check=True)
+            pip = [str(venv / "bin" / "python"), "-m", "pip", "install", "-q", "--disable-pip-version-check"]
+            subprocess.run(pip + ["-U", "pip", "wheel"], check=True, stdout=out, stderr=out)
+            for r in present:
+                rc = subprocess.run(pip + ["-r", str(workdir / r)], stdout=out, stderr=out).returncode
+                if rc != 0:
+                    log(out, f"pip install -r {r} fehlgeschlagen (rc={rc}), Umgebung wird nicht gespeichert")
+                    shutil.rmtree(venv, ignore_errors=True)
+                    raise SystemExit(rc)
+            subprocess.run(pip + ["pytest", "pytest-xdist"], check=True, stdout=out, stderr=out)
+            (venv / ".fertig").write_text(str(int(time.time())))
+            log(out, f"Python-Umgebung fertig in {time.time() - t0:.0f} s")
+    return {"VIRTUAL_ENV": str(venv), "PATH": f"{venv}/bin:" + BREW_PATH}
+
+
+def prepare_node(workdir: Path, out):
+    lock = "package-lock.json" if (workdir / "package-lock.json").is_file() else None
+    if not lock:
+        die("package-lock.json fehlt (npm ci braucht sie)")
+    key = sha_files(workdir, ["package.json", lock])
+    cached = CACHE / "node" / key
+    with Lock(CACHE / "node" / f"{key}.lock"):
+        if not (cached / ".fertig").exists():
+            t0 = time.time()
+            log(out, f"neue node_modules {key} (einmalig je Lockdatei)")
+            shutil.rmtree(cached, ignore_errors=True)
+            cached.mkdir(parents=True)
+            for f in ("package.json", lock):  # nie .npmrc: kann Zugangsdaten tragen
+                shutil.copy2(workdir / f, cached / f)
+            rc = subprocess.run(["npm", "ci", "--no-audit", "--no-fund", "--loglevel=error"], cwd=cached,
+                                env={**os.environ, "PATH": BREW_PATH}, stdout=out, stderr=out).returncode
+            if rc != 0:
+                shutil.rmtree(cached, ignore_errors=True)
+                log(out, f"npm ci fehlgeschlagen (rc={rc})")
+                raise SystemExit(rc)
+            (cached / ".fertig").write_text(str(int(time.time())))
+            log(out, f"node_modules fertig in {time.time() - t0:.0f} s")
+    marker = workdir / "node_modules" / ".studio-ci-key"
+    if not (marker.is_file() and marker.read_text() == key):
+        shutil.rmtree(workdir / "node_modules", ignore_errors=True)
+        # APFS-Klon: sofort, belegt keinen Platz, Änderungen im Arbeitsbereich bleiben dort.
+        subprocess.run(["/bin/cp", "-cR", str(cached / "node_modules"), str(workdir / "node_modules")], check=True)
+        marker.write_text(key)
+    return {"PATH": f"{workdir}/node_modules/.bin:" + BREW_PATH}
+
+
+# --------------------------------------------------------------------------- Slots
+
+def take_slot(out, wait_max):
+    t0 = time.time()
+    announced = False
+    while True:
+        for i in range(1, MAX_SLOTS + 1):
+            fh = open(SLOTS / f"{i}.lock", "w")
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fh, i, time.time() - t0
+            except BlockingIOError:
+                fh.close()
+        if time.time() - t0 > wait_max:
+            log(out, f"alle {MAX_SLOTS} Plätze belegt seit {wait_max} s")
+            sys.exit(75)  # EX_TEMPFAIL: der Client fällt auf arkserver zurück
+        if not announced:
+            log(out, f"alle {MAX_SLOTS} Plätze belegt, warte …")
+            announced = True
+        time.sleep(2)
+
+
+# --------------------------------------------------------------------------- Befehle
+
+def cmd_run(args, from_gate):
+    """run <arbeitsbereich> <unterordner|.> <setup> <timeout> <wartezeit> <detach 0|1> -- <befehl…>"""
+    if "--" not in args:
+        die("run: -- fehlt")
+    i = args.index("--")
+    head, command = args[:i], args[i + 1:]
+    if len(head) != 6 or not command:
+        die("run: Argumente")
+    ws, sub, setup, timeout, wait_max, detach = head
+    if not NAME_RE.match(ws) or not REL_RE.match(sub) or setup not in ("python", "node", "none"):
+        die("run: ungültige Angabe")
+    timeout = min(int(timeout), MAX_TIMEOUT)
+    wait_max = min(int(wait_max), 1800)
+    ensure_dirs()
+    root = WS / ws
+    workdir = (root / sub).resolve()
+    if not str(workdir).startswith(str(root.resolve())) or not workdir.is_dir():
+        die(f"run: Ordner {sub} fehlt im Arbeitsbereich")
+    run_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+    meta = {"id": run_id, "ws": ws, "sub": sub, "cmd": command, "start": time.time(), "status": "läuft"}
+    (RUNS / f"{run_id}.json").write_text(json.dumps(meta))
+    if detach == "1":
+        pid = os.fork()
+        if pid:
+            print(run_id)
+            return 0
+        os.setsid()
+        logf = open(RUNS / f"{run_id}.log", "w", buffering=1)
+        os.dup2(logf.fileno(), 1)
+        os.dup2(logf.fileno(), 2)
+        devnull = os.open(os.devnull, os.O_RDONLY)
+        os.dup2(devnull, 0)
+        out = sys.stdout
+    else:
+        out = Tee(sys.stdout, open(RUNS / f"{run_id}.log", "w", buffering=1))
+    rc = execute(run_id, meta, root, workdir, setup, command, timeout, wait_max, out)
+    if detach == "1":
+        os._exit(rc)
+    return rc
+
+
+class Tee:
+    def __init__(self, *s):
+        self.s = s
+
+    def write(self, d):
+        for x in self.s:
+            x.write(d)
+
+    def flush(self):
+        for x in self.s:
+            x.flush()
+
+    def fileno(self):
+        return self.s[0].fileno()
+
+
+def execute(run_id, meta, root, workdir, setup, command, timeout, wait_max, out):
+    slot_fh, slot, waited = take_slot(out, wait_max)
+    rc = 1
+    try:
+        with Lock(root.parent / f"{root.name}.lock"):
+            log(out, f"Lauf {run_id} · Platz {slot}/{MAX_SLOTS} · wartete {waited:.0f} s")
+            env = {"HOME": str(HOME), "LANG": "en_US.UTF-8", "CI": "1", "STUDIO_CI": "1",
+                   "TMPDIR": str(CI / "tmp"), "PATH": BREW_PATH}
+            (CI / "tmp").mkdir(exist_ok=True)
+            if setup == "python":
+                env.update(prepare_python(workdir, ["requirements.txt", "requirements-dev.txt",
+                                                    "requirements-test.txt"], out))
+            elif setup == "node":
+                env.update(prepare_node(workdir, out))
+            t0 = time.time()
+            p = subprocess.Popen(["/usr/bin/nice", "-n", str(NICE)] + command, cwd=workdir, env=env,
+                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+            def pump():
+                for line in iter(p.stdout.readline, b""):
+                    out.write(line.decode("utf-8", "replace"))
+                    out.flush()
+            reader = threading.Thread(target=pump, daemon=True)
+            reader.start()
+            try:
+                rc = p.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                for sig in (signal.SIGTERM, signal.SIGKILL):
+                    try:
+                        os.killpg(p.pid, sig)
+                        p.wait(timeout=5)
+                        break
+                    except ProcessLookupError:
+                        break
+                    except subprocess.TimeoutExpired:
+                        continue
+                log(out, f"Zeitlimit {timeout} s überschritten, abgebrochen")
+                rc = 124
+            reader.join(timeout=5)
+            log(out, f"Ende rc={rc} nach {time.time() - t0:.1f} s")
+    except SystemExit as e:
+        rc = e.code if isinstance(e.code, int) else 1
+    finally:
+        slot_fh.close()
+        meta.update({"status": "fertig", "rc": rc, "ende": time.time()})
+        (RUNS / f"{run_id}.json").write_text(json.dumps(meta))
+    return rc
+
+
+def cmd_status(args):
+    if len(args) != 1 or not RUN_RE.match(args[0]):
+        die("status <lauf-id>")
+    p = RUNS / f"{args[0]}.json"
+    if not p.is_file():
+        die("unbekannter Lauf", 3)
+    print(p.read_text())
+    return 0
+
+
+def cmd_log(args):
+    if len(args) != 1 or not RUN_RE.match(args[0]):
+        die("log <lauf-id>")
+    p = RUNS / f"{args[0]}.log"
+    if not p.is_file():
+        die("kein Log", 3)
+    sys.stdout.write(p.read_text(errors="replace"))
+    return 0
+
+
+def cmd_ping(_args):
+    load = os.getloadavg()[0]
+    busy = 0
+    for i in range(1, MAX_SLOTS + 1):
+        fh = open(SLOTS / f"{i}.lock", "w") if SLOTS.exists() else None
+        if fh is None:
+            break
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fh, fcntl.LOCK_UN)
+        except BlockingIOError:
+            busy += 1
+        fh.close()
+    print(json.dumps({"ok": True, "load": round(load, 2), "slots": MAX_SLOTS, "belegt": busy,
+                      "kerne": os.cpu_count()}))
+    return 0
+
+
+def cmd_aufraeumen(_args):
+    """Läufe älter als 7 Tage, Caches 14 Tage ohne Nutzung, Arbeitsbereiche 14 Tage ohne Sync."""
+    now = time.time()
+    n = 0
+    for p in RUNS.glob("*"):
+        if now - p.stat().st_mtime > 7 * 86400:
+            p.unlink(missing_ok=True)
+            n += 1
+    for base in (CACHE / "venv", CACHE / "node", WS):
+        for d in base.iterdir() if base.exists() else []:
+            if d.is_dir() and now - d.stat().st_atime > 14 * 86400 and now - d.stat().st_mtime > 14 * 86400:
+                shutil.rmtree(d, ignore_errors=True)
+                n += 1
+    print(f"aufgeräumt: {n}")
+    return 0
+
+
+def main(argv, from_gate=False):
+    ensure_dirs()
+    if not argv:
+        die("Befehl fehlt: run|status|log|ping|aufraeumen")
+    cmd, args = argv[0], argv[1:]
+    table = {"run": lambda a: cmd_run(a, from_gate), "status": cmd_status, "log": cmd_log,
+             "ping": cmd_ping, "aufraeumen": cmd_aufraeumen}
+    if cmd == "gate" and not from_gate:
+        return gate()
+    if cmd not in table:
+        die(f"unbekannt: {cmd}")
+    return table[cmd](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]) or 0)

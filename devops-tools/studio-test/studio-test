@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+"""studio-test: Tests eines Repos auf studio laufen lassen statt auf arkserver. Issue #3999.
+
+    studio-test [optionen] [-- testargumente]
+    studio-test status <lauf-id>      Stand eines --detach-Laufs
+    studio-test log <lauf-id>         dessen volles Log
+    studio-test ping                  ist studio erreichbar, wie belegt
+
+Optionen:
+    --detach        nicht warten, Lauf-ID ausgeben (lange Suiten, Codex)
+    --local         gleich auf arkserver, gedrosselt (agent-tests.slice)
+    --timeout S     Zeitlimit in Sekunden (Vorgabe 1800, höchstens 1800)
+    --cmd "…"       Testbefehl für diesen Lauf statt aus der Konfiguration
+    --dir D         Unterordner für diesen Lauf (statt TEST_DIR)
+    --setup S       python|node|none für diesen Lauf (statt TEST_SETUP)
+    -n, --dry-run   nur zeigen, was geschickt und ausgeführt würde
+
+Konfiguration je Repo in .devops/studio-test.conf (Zeilen KEY=Wert, alles optional):
+    TEST_DIR=backend                     Unterordner, in dem getestet wird (Vorgabe: Repo-Wurzel)
+    TEST_SETUP=python|node|none          Abhängigkeiten vorbereiten (Vorgabe: erkannt)
+    TEST_CMD=python -m pytest -q -n 8    Befehl (Vorgabe: erkannt); Testargumente hängen dahinter
+    TEST_WAIT=600                        so lange auf einen freien Platz warten, sonst lokal
+
+Ohne Konfiguration: requirements.txt → python -m pytest -q, package.json mit "test" → npm test --.
+Nie mitgeschickt: .git, node_modules, .venv/venv, .env*, *.key, *.pem, secrets/, alles aus .gitignore.
+"""
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOST = os.environ.get("STUDIO_TEST_HOST", "studio-ci")
+SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ControlMaster=auto",
+            "-o", "ControlPath=~/.ssh/cm-studio-test-%C", "-o", "ControlPersist=15m",
+            "-o", "ServerAliveInterval=20"]
+EXCLUDES = [".git/", "node_modules/", ".venv/", "venv/", "__pycache__/", ".pytest_cache/", ".env",
+            ".env.*", "*.key", "*.pem", "*.p12", "secrets/", ".secrets/", "*.db", "*.sqlite",
+            "*.sqlite3", "dist/", "build/", ".derived-data/", "DerivedData/", ".npmrc", ".pypirc"]
+LOGDIR = Path.home() / ".cache" / "studio-test"
+FALLBACK_RC = 75
+
+
+def say(msg):
+    sys.stderr.write(f"studio-test: {msg}\n")
+    sys.stderr.flush()
+
+
+def ssh(args, **kw):
+    return subprocess.run(["ssh"] + SSH_OPTS + [HOST] + args, **kw)
+
+
+def repo_root():
+    try:
+        return Path(subprocess.check_output(["git", "rev-parse", "--show-toplevel"], text=True,
+                                            stderr=subprocess.DEVNULL).strip())
+    except subprocess.CalledProcessError:
+        sys.exit("studio-test: kein Git-Repo")
+
+
+def agent_name():
+    for k in ("CLOUD_SESSION_NAME", "AGENT_NAME"):
+        if os.environ.get(k):
+            return os.environ[k]
+    if os.environ.get("TMUX"):
+        try:
+            return subprocess.check_output(["tmux", "display-message", "-p", "#S"], text=True).strip()
+        except Exception:
+            pass
+    return os.environ.get("USER", "agent")
+
+
+def slug(s):
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", s).strip("-.")[:60] or "x"
+
+
+def load_conf(root: Path, over=None):
+    conf = {}
+    p = root / ".devops" / "studio-test.conf"
+    if p.is_file():
+        for line in p.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                conf[k.strip()] = v.strip()
+    conf.update({k: v for k, v in (over or {}).items() if v})
+    sub = conf.get("TEST_DIR", ".")
+    wd = root / sub
+    setup = conf.get("TEST_SETUP")
+    cmd = conf.get("TEST_CMD")
+    if not setup:
+        if (wd / "requirements.txt").is_file():
+            setup = "python"
+        elif (wd / "package.json").is_file():
+            setup = "node"
+        else:
+            setup = "none"
+    if not cmd:
+        if setup == "python":
+            cmd = "python -m pytest -q"
+        elif setup == "node":
+            scripts = json.loads((wd / "package.json").read_text()).get("scripts", {})
+            if "test" not in scripts:
+                sys.exit("studio-test: package.json hat kein \"test\"-Skript, TEST_CMD setzen")
+            cmd = "npm test --"
+        else:
+            sys.exit("studio-test: Testbefehl unbekannt, .devops/studio-test.conf mit TEST_CMD anlegen")
+    return {"sub": sub, "setup": setup, "cmd": shlex.split(cmd), "wait": int(conf.get("TEST_WAIT", "600"))}
+
+
+def sync(root: Path, ws: str, dry):
+    args = ["rsync", "-az", "--delete", "--max-size=50m", "--filter=:- .gitignore"]
+    args += [f"--exclude={e}" for e in EXCLUDES]
+    args += ["-e", "ssh " + " ".join(shlex.quote(o) for o in SSH_OPTS)]
+    if dry:
+        args += ["--dry-run", "-v"]  # kein --itemize-changes: das Gate lässt --log-format nicht durch
+    args += [f"{root}/", f"{HOST}:ws/{ws}/"]
+    t0 = time.time()
+    rc = subprocess.run(args).returncode
+    return rc, time.time() - t0
+
+
+def run_local(root: Path, conf, extra, timeout):
+    wd = root / conf["sub"]
+    cmd = conf["cmd"] + extra
+    say(f"läuft auf arkserver, gedrosselt (agent-tests.slice): {' '.join(cmd)}")
+    base = ["systemd-run", "--user", "--scope", "--quiet", "--slice=agent-tests.slice",
+            "-p", "CPUQuota=400%", "-p", "MemoryMax=6G"]
+    penv = dict(os.environ)
+    # Agenten-Panes haben oft kein XDG_RUNTIME_DIR; ohne findet systemd-run --user den Manager nicht.
+    penv.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    probe = subprocess.run(base + ["true"], capture_output=True, env=penv)
+    pre = base if probe.returncode == 0 else []
+    if not pre:
+        say("systemd-run --user nicht verfügbar, nur nice/ionice")
+    full = pre + ["nice", "-n", "15", "ionice", "-c3", "timeout", str(timeout)] + cmd
+    env = penv
+    if conf["setup"] == "python":
+        for v in (".venv", "venv"):
+            if (wd / v / "bin" / "python").exists():
+                env["PATH"] = f"{wd / v / 'bin'}:" + env["PATH"]
+                env["VIRTUAL_ENV"] = str(wd / v)
+                break
+    elif conf["setup"] == "node":
+        env["PATH"] = f"{wd / 'node_modules' / '.bin'}:" + env["PATH"]
+    # Auf arkserver heißt der Interpreter ohne venv nur python3.
+    i = full.index(cmd[0], len(full) - len(cmd))
+    if full[i] == "python" and not shutil.which("python", path=env["PATH"]):
+        full[i] = "python3"
+    return subprocess.run(full, cwd=wd, env=env).returncode
+
+
+def main():
+    argv = sys.argv[1:]
+    if argv and argv[0] in ("status", "log", "ping"):
+        r = ssh(["studio-ci"] + argv)
+        return r.returncode
+    if argv and argv[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return 0
+    extra = []
+    if "--" in argv:
+        i = argv.index("--")
+        argv, extra = argv[:i], argv[i + 1:]
+    detach = local = dry = False
+    timeout = 1800
+    cmd_override = None
+    over = {}
+    it = iter(argv)
+    for a in it:
+        if a == "--detach":
+            detach = True
+        elif a == "--local":
+            local = True
+        elif a in ("-n", "--dry-run"):
+            dry = True
+        elif a == "--timeout":
+            timeout = min(int(next(it)), 1800)
+        elif a == "--cmd":
+            cmd_override = next(it)
+            over["TEST_CMD"] = cmd_override
+        elif a == "--dir":
+            over["TEST_DIR"] = next(it)
+        elif a == "--setup":
+            over["TEST_SETUP"] = next(it)
+        else:
+            sys.exit(f"studio-test: unbekannte Option {a} (Testargumente nach --)")
+    root = repo_root()
+    conf = load_conf(root, over)
+    if cmd_override:
+        conf["cmd"] = shlex.split(cmd_override)
+    ws = slug(f"{agent_name()}-{root.name}")
+    if local:
+        return run_local(root, conf, extra, timeout)
+
+    rc, dt = sync(root, ws, dry)
+    if dry:
+        say(f"würde ausführen in {conf['sub']} ({conf['setup']}): {' '.join(conf['cmd'] + extra)}")
+        return rc
+    if rc == 255:  # nur ssh nicht erreichbar; rc 12 (z. B. Gate lehnt ab) ist ein Fehler, kein Rückfall
+        say(f"studio nicht erreichbar (rsync rc={rc}), Rückfall auf arkserver")
+        return run_local(root, conf, extra, timeout)
+    if rc != 0:
+        say(f"Abgleich fehlgeschlagen (rsync rc={rc})")
+        return rc
+    say(f"Abgleich {dt:.1f} s → studio:{ws}")
+
+    remote = ["studio-ci", "run", ws, conf["sub"], conf["setup"], str(timeout), str(conf["wait"]),
+              "1" if detach else "0", "--"] + conf["cmd"] + extra
+    remote_str = " ".join(shlex.quote(x) for x in remote)
+    LOGDIR.mkdir(parents=True, exist_ok=True)
+    if detach:
+        r = ssh([remote_str], capture_output=True, text=True)
+        if r.returncode != 0:
+            sys.stderr.write(r.stderr)
+            return r.returncode
+        run_id = r.stdout.strip()
+        print(run_id)
+        say(f"läuft im Hintergrund. Stand: studio-test status {run_id} · Log: studio-test log {run_id}")
+        return 0
+    t0 = time.time()
+    logpath = LOGDIR / f"{time.strftime('%Y%m%d-%H%M%S')}-{ws}.log"
+    with open(logpath, "w") as logf:
+        p = subprocess.Popen(["ssh"] + SSH_OPTS + [HOST, remote_str], stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT)
+        for line in iter(p.stdout.readline, b""):
+            s = line.decode("utf-8", "replace")
+            sys.stdout.write(s)
+            sys.stdout.flush()
+            logf.write(s)
+        rc = p.wait()
+    if rc == FALLBACK_RC:
+        say("studio voll belegt, Rückfall auf arkserver")
+        return run_local(root, conf, extra, timeout)
+    if rc == 255:
+        say("Verbindung zu studio abgebrochen, Rückfall auf arkserver")
+        return run_local(root, conf, extra, timeout)
+    say(f"rc={rc} · gesamt {time.time() - t0 + dt:.1f} s · Log {logpath}")
+    return rc
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
