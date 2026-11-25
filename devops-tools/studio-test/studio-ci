@@ -320,8 +320,12 @@ def prepare_node(workdir: Path, out):
     marker = workdir / "node_modules" / ".studio-ci-key"
     if not (marker.is_file() and marker.read_text() == key):
         remove_path(workdir / "node_modules")
-        # APFS-Klon: sofort, belegt keinen Platz, Änderungen im Arbeitsbereich bleiben dort.
-        subprocess.run(["/bin/cp", "-cR", str(cached / "node_modules"), str(workdir / "node_modules")], check=True)
+        if (cached / "node_modules").is_dir():
+            # APFS-Klon: sofort, belegt keinen Platz, Änderungen im Arbeitsbereich bleiben dort.
+            subprocess.run(["/bin/cp", "-cR", str(cached / "node_modules"), str(workdir / "node_modules")],
+                           check=True)
+        else:  # ohne Abhängigkeiten legt npm ci keinen Ordner an
+            (workdir / "node_modules").mkdir()
         marker.write_text(key)
     return {"PATH": f"{workdir}/node_modules/.bin:" + BREW_PATH}
 
