@@ -13,6 +13,7 @@ Optionen:
     --cmd "…"       Testbefehl für diesen Lauf statt aus der Konfiguration
     --dir D         Unterordner für diesen Lauf (statt TEST_DIR)
     --setup S       python|node|none für diesen Lauf (statt TEST_SETUP)
+    --teile N       Testdateien auf N parallele Prozesse verteilen (statt TEST_TEILE, 1 bis 16)
     -n, --dry-run   nur zeigen, was geschickt und ausgeführt würde
 
 Konfiguration je Repo in .devops/studio-test.conf (Zeilen KEY=Wert, alles optional):
@@ -22,6 +23,8 @@ Konfiguration je Repo in .devops/studio-test.conf (Zeilen KEY=Wert, alles option
     TEST_WAIT=600                        so lange auf einen freien Platz warten, sonst lokal
     TEST_PIP=paket==1.2 …                zusätzliche Testpakete (nur Name[extra] und Version)
     TEST_PROD_VENV=/var/www/x/venv|aus   venv der Produktion für den Abgleich (Vorgabe: erkannt)
+    TEST_TEILE=6                         Testdateien sortiert reihum auf 6 Prozesse, je eigenes TMPDIR
+    TEST_DATEIEN=tests/test_*.py         welche Dateien verteilt werden (Muster relativ zu TEST_DIR)
 
 Abgleich mit Produktion (Python): Gibt es auf arkserver /var/www/<repo>/venv, gehen ihre Python-Version und
 ihre Paketversionen mit. studio baut die Umgebung dann mit denselben Versionen; passen sie nicht zum Stand,
@@ -37,6 +40,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -117,8 +121,20 @@ def load_conf(root: Path, over=None):
             cmd = "npm test --"
         else:
             sys.exit("studio-test: Testbefehl unbekannt, .devops/studio-test.conf mit TEST_CMD anlegen")
+    teile = int(conf.get("TEST_TEILE", "1") or 1)
+    if not 1 <= teile <= 16:
+        sys.exit("studio-test: TEST_TEILE muss 1 bis 16 sein")
     return {"sub": sub, "setup": setup, "cmd": shlex.split(cmd), "wait": int(conf.get("TEST_WAIT", "600")),
-            "prod_venv": conf.get("TEST_PROD_VENV", "")}
+            "prod_venv": conf.get("TEST_PROD_VENV", ""), "teile": teile,
+            "dateien": conf.get("TEST_DATEIEN", "tests/test_*.py").split()}
+
+
+def split_files(wd: Path, muster, teile):
+    """Wie studio-ci: Dateien sortiert, reihum auf die Teile."""
+    files = sorted({str(f.relative_to(wd)) for m in muster for f in wd.glob(m) if f.is_file()})
+    if not files:
+        sys.exit(f"studio-test: TEST_DATEIEN: keine Datei für {' '.join(muster)}")
+    return [files[k::teile] for k in range(teile) if files[k::teile]]
 
 
 def repo_name(root: Path) -> str:
@@ -208,7 +224,7 @@ def run_local(root: Path, conf, extra, timeout):
     if not pre:
         say("systemd-run --user nicht verfügbar, nur nice/ionice")
     full = pre + ["nice", "-n", "15", "ionice", "-c3", "timeout", str(timeout)] + cmd
-    env = penv
+    env = dict(penv)
     if conf["setup"] == "python":
         for v in (".venv", "venv"):
             if (wd / v / "bin" / "python").exists():
@@ -221,7 +237,34 @@ def run_local(root: Path, conf, extra, timeout):
     i = full.index(cmd[0], len(full) - len(cmd))
     if full[i] == "python" and not shutil.which("python", path=env["PATH"]):
         full[i] = "python3"
-    return subprocess.run(full, cwd=wd, env=env).returncode
+    if conf["teile"] <= 1:
+        return subprocess.run(full, cwd=wd, env=env).returncode
+    # Aufgeteilt: je Teil ein Prozess mit eigenem TMPDIR, die Drosselung gilt für alle zusammen nicht,
+    # deshalb je Teil ein eigener Scope mit anteiliger Quote.
+    parts = split_files(wd, conf["dateien"], conf["teile"])
+    quota = max(100, 400 // len(parts))
+    if pre:
+        full = [x if x != "CPUQuota=400%" else f"CPUQuota={quota}%" for x in full]
+    t0 = time.time()
+    procs = []
+    with tempfile.TemporaryDirectory(prefix="studio-test-teile-") as tmp:
+        for k, files in enumerate(parts, 1):
+            td = Path(tmp) / f"teil{k}"
+            td.mkdir()
+            logp = td.with_suffix(".log")
+            procs.append((k, subprocess.Popen(full + files, cwd=wd, env={**env, "TMPDIR": str(td), "STUDIO_TEIL": str(k)},
+                                              stdout=open(logp, "wb"), stderr=subprocess.STDOUT), logp, len(files)))
+        say(f"{len(parts)} Teile gestartet")
+        rcs = []
+        for k, p, logp, n in procs:
+            rc = p.wait()
+            rcs.append(rc)
+            text = logp.read_text(errors="replace").splitlines()
+            say(f"Teil {k}/{len(parts)} rc={rc} nach {time.time() - t0:.0f} s ({n} Dateien)")
+            for x in [x for x in text if x.startswith(("FAILED", "ERROR"))][:50] + text[-1:]:
+                print(f"  [{k}] {x}")
+    bad = [rc for rc in rcs if rc != 0]
+    return bad[0] if bad else 0
 
 
 def main():
@@ -257,6 +300,8 @@ def main():
             over["TEST_DIR"] = next(it)
         elif a == "--setup":
             over["TEST_SETUP"] = next(it)
+        elif a == "--teile":
+            over["TEST_TEILE"] = next(it)
         else:
             sys.exit(f"studio-test: unbekannte Option {a} (Testargumente nach --)")
     root = repo_root()
@@ -264,6 +309,12 @@ def main():
     if cmd_override:
         conf["cmd"] = shlex.split(cmd_override)
     ws = slug(f"{agent_name()}-{root.name}")
+    if conf["teile"] > 1:
+        wd = root / conf["sub"]
+        pfade = [a for a in extra if not a.startswith("-") and (wd / a.split("::")[0]).exists()]
+        if pfade:  # einzelne Dateien oder Tests angegeben: nicht aufteilen, sonst kämen alle Dateien dazu
+            say(f"Pfad angegeben ({pfade[0]}), ohne Aufteilung")
+            conf["teile"] = 1
     if local:
         return run_local(root, conf, extra, timeout)
 
@@ -282,7 +333,8 @@ def main():
         + (f" · Versionen wie Produktion: {conf['abgleich']}" if conf.get("abgleich") else ""))
 
     remote = ["studio-ci", "run", ws, conf["sub"], conf["setup"], str(timeout), str(conf["wait"]),
-              "1" if detach else "0", "--"] + conf["cmd"] + extra
+              "1" if detach else "0"] + ([f"teile={conf['teile']}"] if conf["teile"] > 1 else []) + ["--"] \
+        + conf["cmd"] + extra
     remote_str = " ".join(shlex.quote(x) for x in remote)
     LOGDIR.mkdir(parents=True, exist_ok=True)
     if detach:
