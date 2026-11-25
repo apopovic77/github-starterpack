@@ -268,6 +268,22 @@ def tree_hash(path: Path) -> str:
     return h.hexdigest()
 
 
+def remove_path(p: Path):
+    """Entfernt Datei, Symlink oder Ordner. rmtree allein scheitert still an Symlinks und gesperrten
+    Ordnern; der Rest blockiert danach den APFS-Klon mit „File exists“ (#3999)."""
+    if p.is_symlink() or p.is_file():
+        p.unlink()
+    elif p.is_dir():
+        for d, _dirs, _files in os.walk(p, followlinks=False):  # Schreibrecht zurück, falls ein Test es nahm
+            try:
+                os.chmod(d, 0o700)
+            except OSError:
+                pass
+        shutil.rmtree(p)
+    if p.exists() or p.is_symlink():
+        die(f"{p.name} im Arbeitsbereich lässt sich nicht entfernen")
+
+
 def prepare_node(workdir: Path, out):
     lock = "package-lock.json" if (workdir / "package-lock.json").is_file() else None
     if not lock:
@@ -303,7 +319,7 @@ def prepare_node(workdir: Path, out):
             log(out, f"node_modules fertig in {time.time() - t0:.0f} s")
     marker = workdir / "node_modules" / ".studio-ci-key"
     if not (marker.is_file() and marker.read_text() == key):
-        shutil.rmtree(workdir / "node_modules", ignore_errors=True)
+        remove_path(workdir / "node_modules")
         # APFS-Klon: sofort, belegt keinen Platz, Änderungen im Arbeitsbereich bleiben dort.
         subprocess.run(["/bin/cp", "-cR", str(cached / "node_modules"), str(workdir / "node_modules")], check=True)
         marker.write_text(key)
