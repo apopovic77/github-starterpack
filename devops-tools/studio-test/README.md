@@ -18,6 +18,11 @@ sequenceDiagram
   C-->>A: wie lokal, Log unter ~/.cache/studio-test/
 ```
 
+**Wofür, und wofür nicht:** `studio-test` ist für schnelle Rückmeldung beim Entwickeln da. Sein
+Ergebnis entscheidet nie über `main` oder ein Release. Die Suite des Release-Takts läuft weiter auf den
+Runnern am Kern. Grund: Bauen und Testen laufen auf studio unter demselben Benutzer, ein Test kann
+die geteilten Caches verändern und einem späteren Lauf ein falsches Grün liefern.
+
 ### Benutzung
 
 ```bash

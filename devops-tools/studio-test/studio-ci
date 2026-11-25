@@ -333,9 +333,20 @@ def build_git_index(root: Path, out):
     gd = root / ".git"
     # Je Lauf frisch: Ein Test des vorigen Laufs könnte in .git/config fsmonitor, Filter oder Hooks gesetzt
     # haben, die der nächste git add sonst ausführt (Hinweis Cloud-Operator).
+    if gd.is_symlink() or gd.is_file():
+        gd.unlink(missing_ok=True)
+    elif gd.is_dir():
+        for d, dirs, _files in os.walk(gd, followlinks=False):  # Schreibrecht zurück, falls ein Test es nahm
+            try:
+                os.chmod(d, 0o700)
+            except OSError:
+                pass
     shutil.rmtree(gd, ignore_errors=True)
     if gd.exists() or gd.is_symlink():
-        (gd.unlink() if gd.is_symlink() or gd.is_file() else None)
+        # Teilweise stehen geblieben (z. B. ein Test hat .git auf 0555 gesetzt): git init würde die alte
+        # config samt Filtern übernehmen. Dann lieber ohne Index (Hinweis Cloud-Operator).
+        log(out, ".git ließ sich nicht vollständig entfernen, Git-Index ausgelassen")
+        return
     subprocess.run([git, "init", "-q", str(root)], env=env, check=False)
     pf = gd / "studio-ci-pathspec"
     pf.write_bytes(b"\0".join(keep))
