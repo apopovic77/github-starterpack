@@ -231,7 +231,7 @@ def build_venv(py, venv: Path, workdir: Path, present, extra, cons, out) -> bool
         if rc != 0:
             log(out, f"pip install -r {r} fehlgeschlagen (rc={rc})")
             return False
-    # pytest selbst nicht an Produktion binden: dort fehlt es meist, die Vorgabe greift dann ohnehin nicht.
+    # Die Vorgabe gilt auch hier: Steht pytest in der Produktions-venv, kommt dessen Version (gewollt).
     rc = subprocess.run(pip + ["pytest", "pytest-xdist"] + list(extra), stdout=out, stderr=out).returncode
     if rc != 0:
         log(out, f"pip install pytest/TEST_PIP fehlgeschlagen (rc={rc})")
@@ -239,11 +239,44 @@ def build_venv(py, venv: Path, workdir: Path, present, extra, cons, out) -> bool
     return True
 
 
+def local_file_deps(workdir: Path, out) -> list:
+    """Relative Ziele aller "file:"-Abhängigkeiten aus package.json, nur innerhalb des Arbeitsbereichs."""
+    try:
+        pkg = json.loads((workdir / "package.json").read_text())
+    except (OSError, ValueError):
+        return []
+    found = set()
+    for sect in ("dependencies", "devDependencies", "optionalDependencies", "overrides"):
+        for v in (pkg.get(sect) or {}).values():
+            if isinstance(v, str) and v.startswith("file:"):
+                rel = v[5:][2:] if v[5:].startswith("./") else v[5:]
+                target = (workdir / rel).resolve()
+                if not REL_RE.match(rel) or not str(target).startswith(str(workdir.resolve()) + "/") or not target.exists():
+                    log(out, f"file:-Abhängigkeit außerhalb des Arbeitsbereichs oder fehlend, übergangen: {v}")
+                    continue
+                found.add(rel)
+    return sorted(found)
+
+
+def tree_hash(path: Path) -> str:
+    h = hashlib.sha256()
+    if path.is_file():
+        h.update(path.read_bytes())
+    else:
+        for f in sorted(p for p in path.rglob("*") if p.is_file() and "node_modules" not in p.parts):
+            h.update(str(f.relative_to(path)).encode() + b"\0" + f.read_bytes())
+    return h.hexdigest()
+
+
 def prepare_node(workdir: Path, out):
     lock = "package-lock.json" if (workdir / "package-lock.json").is_file() else None
     if not lock:
         die("package-lock.json fehlt (npm ci braucht sie)")
-    key = sha_files(workdir, ["package.json", lock])
+    local = local_file_deps(workdir, out)
+    h = hashlib.sha256(sha_files(workdir, ["package.json", lock]).encode())
+    for rel in local:
+        h.update(b"\0" + rel.encode() + b"\0" + tree_hash(workdir / rel).encode())
+    key = h.hexdigest()[:16]
     cached = CACHE / "node" / key
     with Lock(CACHE / "node" / f"{key}.lock"):
         if not (cached / ".fertig").exists():
@@ -253,6 +286,13 @@ def prepare_node(workdir: Path, out):
             cached.mkdir(parents=True)
             for f in ("package.json", lock):  # nie .npmrc: kann Zugangsdaten tragen
                 shutil.copy2(workdir / f, cached / f)
+            for rel in local:  # lokale file:-Abhängigkeiten (z. B. vendor/*.tgz), relativ wie im Repo
+                src, dst = workdir / rel, cached / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                if src.is_dir():
+                    shutil.copytree(src, dst, ignore=shutil.ignore_patterns("node_modules", ".git"))
+                else:
+                    shutil.copy2(src, dst)
             rc = subprocess.run(["npm", "ci", "--no-audit", "--no-fund", "--loglevel=error"], cwd=cached,
                                 env={**os.environ, "PATH": BREW_PATH}, stdout=out, stderr=out).returncode
             if rc != 0:
