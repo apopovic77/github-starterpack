@@ -44,7 +44,9 @@ HOST = os.environ.get("STUDIO_TEST_HOST", "studio-ci")
 SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ControlMaster=auto",
             "-o", "ControlPath=~/.ssh/cm-studio-test-%C", "-o", "ControlPersist=15m",
             "-o", "ServerAliveInterval=20"]
-EXCLUDES = [".git", "node_modules/", ".venv/", "venv/", "__pycache__/", ".pytest_cache/", ".env",
+# node_modules, .venv und venv ohne Schrägstrich: Sie sind in worktrees oft Symlinks, und ein Muster mit "/"
+# trifft nur Ordner. Der Link ginge sonst mit und blockiert auf studio den APFS-Klon (#3999, CloudV2).
+EXCLUDES = [".git", "node_modules", ".venv", "venv", "__pycache__/", ".pytest_cache/", ".env",
             ".env.*", "*.key", "*.pem", "*.p12", "secrets/", ".secrets/", "*.db", "*.sqlite",
             "*.sqlite3", "dist/", "build/", ".derived-data/", "DerivedData/", ".npmrc", ".pypirc"]
 LOGDIR = Path.home() / ".cache" / "studio-test"
