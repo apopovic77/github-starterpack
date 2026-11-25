@@ -14,6 +14,7 @@ studio leistet der Benutzer agentos-ci selbst (kein Admin, kein Zugriff auf frem
 authorized_keys und dieses Skript gehören deshalb root und sind für agentos-ci nicht schreibbar.
 """
 import fcntl
+import fnmatch
 import hashlib
 import json
 import os
@@ -206,6 +207,15 @@ def test_pins(workdir: Path, extra) -> set:
                 if ln and not ln.startswith("-"):
                     names.add(pkg_name(ln))
     names.discard("")
+    # Was das Repo zur Laufzeit braucht, bleibt in der Version der Produktion, auch wenn es zusätzlich in
+    # requirements-test steht (Hinweis Cloud-Operator).
+    for r in ("requirements.txt", "requirements.lock"):
+        f = workdir / r
+        if f.is_file():
+            for ln in f.read_text(errors="replace").splitlines():
+                ln = ln.split("#", 1)[0].strip()
+                if ln and not ln.startswith("-"):
+                    names.discard(pkg_name(ln))
     return names
 
 
@@ -426,7 +436,16 @@ def build_git_index(root: Path, out):
     if rc != 0:
         log(out, f"Git-Index für ls-files nicht gebaut (rc={rc}), Tests mit git können scheitern")
     else:
-        log(out, f"Git-Index mit {len(keep)} Dateien in {time.time() - t0:.1f} s (ohne Verlauf)")
+        # Ein einzelner Commit ohne Eltern, damit `git rev-parse HEAD` antwortet. Sein Hash ist nicht der des
+        # Repos; Tests, die Verlauf oder den echten Hash brauchen, gehören nach arkserver.
+        cenv = {**env, "GIT_AUTHOR_NAME": "studio-ci", "GIT_AUTHOR_EMAIL": "studio-ci@localhost",
+                "GIT_COMMITTER_NAME": "studio-ci", "GIT_COMMITTER_EMAIL": "studio-ci@localhost",
+                "GIT_AUTHOR_DATE": "2000-01-01T00:00:00Z", "GIT_COMMITTER_DATE": "2000-01-01T00:00:00Z"}
+        rc = subprocess.run([git, "-C", str(root), "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false",
+                             "commit", "-q", "--no-verify", "--allow-empty", "-m", "studio-ci: Stand ohne Verlauf"],
+                            env=cenv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
+        log(out, f"Git-Index mit {len(keep)} Dateien in {time.time() - t0:.1f} s (ohne Verlauf"
+            + (", HEAD ist ein Ersatz-Commit)" if rc == 0 else ", ohne HEAD)"))
 
 
 def raise_nofile(out):
@@ -539,8 +558,14 @@ def split_files(root: Path, workdir: Path, teile: int, out):
         log(out, f"TEST_DATEIEN: ungültiges Muster {bad[0] if bad else ''!r}")
         raise SystemExit(2)
     wr = workdir.resolve()
+    ohne_f = root / ".studio-test" / "ohne"
+    ohne = [x for x in (ohne_f.read_text(errors="replace").split() if ohne_f.is_file() else []) if GLOB_RE.match(x)]
     files = sorted({str(f.relative_to(workdir)) for m in muster for f in workdir.glob(m)
                     if f.is_file() and str(f.resolve()).startswith(str(wr) + "/")})
+    if ohne:
+        vorher = len(files)
+        files = [f for f in files if not any(fnmatch.fnmatch(f, o) for o in ohne)]
+        log(out, f"ohne {' '.join(ohne)}: {vorher - len(files)} Dateien ausgelassen")
     if not files:
         log(out, f"TEST_DATEIEN: keine Datei für {' '.join(muster)}")
         raise SystemExit(2)

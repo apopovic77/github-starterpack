@@ -65,6 +65,8 @@ TEST_DATEIEN=tests/test_*.py
   cloud-api mit `CLOUD_API_DATA_DIR`), ist damit je Teil getrennt.
 - Rückgabewert 0 nur, wenn alle Teile 0 liefern. Die Ausgabe zeigt je Teil `FAILED`/`ERROR` und die letzte
   Zeile, `studio-test log <id>` die vollen Logs aller Teile.
+- `TEST_OHNE` bzw. `--ohne MUSTER` (mehrfach) lässt Dateien beim Aufteilen aus, etwa solche, die Linux
+  oder Git-Verlauf brauchen. Die Ausgabe nennt die Zahl.
 - Für einen Lauf: `--teile N`. Steht unter den Testargumenten ein Pfad (`-- tests/test_x.py`), wird nicht
   aufgeteilt.
 - Beim Rückfall auf arkserver wird genauso aufgeteilt, die CPU-Quote je Teil entsprechend kleiner.
@@ -90,7 +92,8 @@ auf. Dann baut studio-ci ohne Vorgabe und schreibt einen Hinweis in die Ausgabe.
 - `TEST_PROD_VENV=/pfad/zur/venv` (oder `--prod-venv`) nimmt eine bestimmte venv, `aus` schaltet den
   Abgleich ab.
 - **Testwerkzeuge** aus `requirements-test.txt`, `requirements-dev.txt` und `TEST_PIP` (dazu `pytest-xdist`)
-  nehmen die Version des Repos, nicht die der Produktion. Die Ausgabe nennt sie.
+  nehmen die Version des Repos, nicht die der Produktion. Die Ausgabe nennt sie. Steht ein Paket auch in
+  `requirements.txt` bzw. `requirements.lock`, gilt für es weiter die Version der Produktion.
 - **Streng** (`--streng` bzw. `TEST_STRENG=1`, für das Release-Tor): Alle übrigen Pakete in genau der
   Version der Produktion, Python wie in Produktion. Geht das nicht, endet der Lauf mit rc 3 statt ohne
   Vorgabe weiterzubauen. Ein Rückfall auf arkserver findet nicht statt: Bei rc 255 oder 75 rechnet der
@@ -200,7 +203,8 @@ Pipeline nimmt einen eigenen Benutzer auf studio mit demselben `studio-ci`:
 `.git` geht nie mit. Damit Tests mit `git ls-files` trotzdem laufen, schickt `studio-test` die Liste
 der versionierten Dateien mit (`.studio-test/tracked`). studio-ci baut daraus vor jedem Lauf einen
 Git-Index ohne Verlauf. Dateien, die nicht übertragen wurden (etwa `.env`), fehlen darin. `git log`,
-`git diff` und `git blame` liefern dort nichts; Tests, die den Verlauf brauchen, gehören auf
+`git diff` und `git blame` liefern dort nichts. `HEAD` ist ein einzelner Ersatz-Commit ohne Eltern, damit
+`git rev-parse HEAD` antwortet; sein Hash ist nicht der des Repos; Tests, die den Verlauf brauchen, gehören auf
 `--local`.
 
 ### Grenzen
