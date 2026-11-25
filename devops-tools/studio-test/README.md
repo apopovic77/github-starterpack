@@ -87,8 +87,14 @@ Umgebung dann mit derselben Python-Version (falls auf studio vorhanden) und den 
 `pip -c`-Vorgabe. Braucht der Arbeitsstand neuere Pakete als Produktion, löst pip die Vorgabe nicht
 auf. Dann baut studio-ci ohne Vorgabe und schreibt einen Hinweis in die Ausgabe.
 
-- `TEST_PROD_VENV=/pfad/zur/venv` nimmt eine bestimmte venv, `TEST_PROD_VENV=aus` schaltet den
+- `TEST_PROD_VENV=/pfad/zur/venv` (oder `--prod-venv`) nimmt eine bestimmte venv, `aus` schaltet den
   Abgleich ab.
+- **Testwerkzeuge** aus `requirements-test.txt`, `requirements-dev.txt` und `TEST_PIP` (dazu `pytest-xdist`)
+  nehmen die Version des Repos, nicht die der Produktion. Die Ausgabe nennt sie.
+- **Streng** (`--streng` bzw. `TEST_STRENG=1`, für das Release-Tor): Alle übrigen Pakete in genau der
+  Version der Produktion, Python wie in Produktion. Geht das nicht, endet der Lauf mit rc 3 statt ohne
+  Vorgabe weiterzubauen. Ein Rückfall auf arkserver findet nicht statt: Bei rc 255 oder 75 rechnet der
+  Aufrufer selbst mit seiner Umgebung.
 - Liegt die Produktion nicht auf arkserver, gehören die Versionen als `requirements.lock` ins Repo.
   Das ist ohnehin der gründlichere Weg.
 
@@ -183,11 +189,11 @@ Pipeline nimmt einen eigenen Benutzer auf studio mit demselben `studio-ci`:
     env:
       STUDIO_TEST_HOST: studio-release
       AGENT_NAME: release
-    run: studio-test --teile 6 -- --tb=no -rfE
+    run: studio-test --streng --teile 6 -- --tb=no -rfE
   ```
 
-  Der Exit-Code ist das Ergebnis. Ist studio nicht erreichbar (rc 255) oder voll (75), rechnet der Runner
-  den Lauf selbst, ebenso aufgeteilt.
+  Der Exit-Code ist das Ergebnis. Mit `--streng` gibt studio-test bei rc 255 (nicht erreichbar) oder 75
+  (voll) diesen Wert zurück, die Pipeline rechnet dann selbst. rc 3: Umgebung nicht wie in Produktion.
 
 ### Git im Arbeitsbereich
 

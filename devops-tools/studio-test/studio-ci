@@ -186,8 +186,32 @@ def read_abgleich(root: Path):
     return want, sorted(set(cons))
 
 
+def pkg_name(spec: str) -> str:
+    m = re.match(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)", spec)
+    return re.sub(r"[-_.]+", "-", m.group(1)).lower() if m else ""
+
+
+TEST_REQ = ("requirements-test.txt", "requirements-dev.txt")
+
+
+def test_pins(workdir: Path, extra) -> set:
+    """Namen der Testwerkzeuge, die das Repo selbst festlegt (requirements-test/-dev, TEST_PIP). Für sie gilt
+    die Version des Repos, nicht die der Produktion (dort steht z. B. ein neueres pytest)."""
+    names = {pkg_name(x) for x in extra} | {"pytest-xdist"}
+    for r in TEST_REQ:
+        f = workdir / r
+        if f.is_file():
+            for ln in f.read_text(errors="replace").splitlines():
+                ln = ln.split("#", 1)[0].strip()
+                if ln and not ln.startswith("-"):
+                    names.add(pkg_name(ln))
+    names.discard("")
+    return names
+
+
 def prepare_python(workdir: Path, req_files, out, extra_pip=(), root: Path = None):
     want, cons = read_abgleich(root or workdir)
+    streng = ((root or workdir) / ".studio-test" / "streng").is_file()
     py = pick_python(os.environ.get("STUDIO_CI_PYTHON", "") or want, out)
     ver = subprocess.run([py, "-c", "import sys;print('%d.%d'%sys.version_info[:2])"],
                          capture_output=True, text=True).stdout.strip()
@@ -196,6 +220,19 @@ def prepare_python(workdir: Path, req_files, out, extra_pip=(), root: Path = Non
         # Mit Lockdatei installiert die CI nur diese (issue-api #2140); requirements.txt ist dann ungenau.
         present.remove("requirements.txt")
     extra = sorted(set(extra_pip))
+    pins = test_pins(workdir, extra)
+    weg = sorted(c for c in cons if pkg_name(c) in pins)
+    cons = [c for c in cons if pkg_name(c) not in pins]
+    if weg:
+        log(out, f"Testwerkzeuge in der Version des Repos statt der Produktion: {', '.join(weg)}")
+    if streng:
+        # Streng (Release-Tor): genau die Pakete der Produktion, sonst Fehler statt Weiterbau ohne Vorgabe.
+        if not cons:
+            log(out, "streng: keine Versionen aus Produktion mitgeschickt")
+            raise SystemExit(3)
+        if want and ver != want:
+            log(out, f"streng: Python {want} wie in Produktion fehlt auf studio (hier {ver})")
+            raise SystemExit(3)
     key = f"py{ver}-" + hashlib.sha256((sha_files(workdir, present) + "|" + " ".join(extra) + "|"
                                         + "\n".join(cons)).encode()).hexdigest()[:16]
     venv = CACHE / "venv" / key
@@ -204,6 +241,10 @@ def prepare_python(workdir: Path, req_files, out, extra_pip=(), root: Path = Non
             t0 = time.time()
             log(out, f"neue Python-Umgebung {key} (Python {ver}, {len(cons)} Versionen aus Produktion)")
             ok = build_venv(py, venv, workdir, present, extra, cons, out)
+            if not ok and cons and streng:
+                shutil.rmtree(venv, ignore_errors=True)
+                log(out, "streng: Die Versionen aus Produktion passen nicht zu diesem Stand, Abbruch")
+                raise SystemExit(3)
             if not ok and cons:
                 log(out, "Versionen aus Produktion passen nicht zu diesem Stand, baue ohne Vorgabe")
                 ok = build_venv(py, venv, workdir, present, extra, [], out)
@@ -215,7 +256,12 @@ def prepare_python(workdir: Path, req_files, out, extra_pip=(), root: Path = Non
             (venv / ".fertig").write_text(str(int(time.time())))
             log(out, f"Python-Umgebung fertig in {time.time() - t0:.0f} s")
         elif (venv / ".ohne-abgleich").exists():
+            if streng:
+                log(out, "streng: Die Umgebung im Cache ist ohne Versionen aus Produktion gebaut, Abbruch")
+                raise SystemExit(3)
             log(out, "Hinweis: Umgebung ohne Versionen aus Produktion (sie passten nicht zu diesem Stand)")
+    if cons:
+        log(out, f"Python {ver}, {len(cons)} Pakete in der Version der Produktion")
     return {"VIRTUAL_ENV": str(venv), "PATH": f"{venv}/bin:" + BREW_PATH}
 
 
