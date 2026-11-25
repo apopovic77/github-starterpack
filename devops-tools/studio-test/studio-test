@@ -15,6 +15,7 @@ Optionen:
     --setup S       python|node|none für diesen Lauf (statt TEST_SETUP)
     --teile N       Testdateien auf N parallele Prozesse verteilen (statt TEST_TEILE, 1 bis 16)
     --prod-venv P   venv der Produktion für den Abgleich, "aus" schaltet ihn ab (statt TEST_PROD_VENV)
+    --ohne MUSTER   Datei(en) beim Aufteilen auslassen, mehrfach möglich (zu TEST_OHNE)
     --streng        Release-Tor: Pakete genau wie in Produktion, sonst Fehler (rc 3) statt Weiterbau
     -n, --dry-run   nur zeigen, was geschickt und ausgeführt würde
 
@@ -27,6 +28,7 @@ Konfiguration je Repo in .devops/studio-test.conf (Zeilen KEY=Wert, alles option
     TEST_PROD_VENV=/var/www/x/venv|aus   venv der Produktion für den Abgleich (Vorgabe: erkannt)
     TEST_TEILE=6                         Testdateien sortiert reihum auf 6 Prozesse, je eigenes TMPDIR
     TEST_DATEIEN=tests/test_*.py         welche Dateien verteilt werden (Muster relativ zu TEST_DIR)
+    TEST_OHNE=tests/test_x.py …          diese Dateien beim Aufteilen auslassen (Muster)
 
 Abgleich mit Produktion (Python): Gibt es auf arkserver /var/www/<repo>/venv, gehen ihre Python-Version und
 ihre Paketversionen mit. studio baut die Umgebung dann mit denselben Versionen; passen sie nicht zum Stand,
@@ -35,6 +37,7 @@ ohne Vorgabe, mit Hinweis in der Ausgabe.
 Ohne Konfiguration: requirements.txt → python -m pytest -q, package.json mit "test" → npm test --.
 Nie mitgeschickt: .git, node_modules, .venv/venv, .env*, *.key, *.pem, secrets/, alles aus .gitignore.
 """
+import fnmatch
 import json
 import os
 import re
@@ -101,7 +104,7 @@ def load_conf(root: Path, over=None):
             if line and not line.startswith("#") and "=" in line:
                 k, v = line.split("=", 1)
                 conf[k.strip()] = v.strip()
-    conf.update({k: v for k, v in (over or {}).items() if v})
+    conf.update({k: v for k, v in (over or {}).items() if v and not k.startswith("_")})
     sub = conf.get("TEST_DIR", ".")
     wd = root / sub
     setup = conf.get("TEST_SETUP")
@@ -129,12 +132,14 @@ def load_conf(root: Path, over=None):
     return {"sub": sub, "setup": setup, "cmd": shlex.split(cmd), "wait": int(conf.get("TEST_WAIT", "600")),
             "prod_venv": conf.get("TEST_PROD_VENV", ""), "teile": teile,
             "streng": conf.get("TEST_STRENG", "") == "1",
+            "ohne": conf.get("TEST_OHNE", "").split() + list((over or {}).get("_ohne", [])),
             "dateien": conf.get("TEST_DATEIEN", "tests/test_*.py").split()}
 
 
-def split_files(wd: Path, muster, teile):
-    """Wie studio-ci: Dateien sortiert, reihum auf die Teile."""
+def split_files(wd: Path, muster, teile, ohne=()):
+    """Wie studio-ci: Dateien sortiert, ohne die Ausnahmen, reihum auf die Teile."""
     files = sorted({str(f.relative_to(wd)) for m in muster for f in wd.glob(m) if f.is_file()})
+    files = [f for f in files if not any(fnmatch.fnmatch(f, o) for o in ohne)]
     if not files:
         sys.exit(f"studio-test: TEST_DATEIEN: keine Datei für {' '.join(muster)}")
     return [files[k::teile] for k in range(teile) if files[k::teile]]
@@ -170,6 +175,7 @@ def abgleich_dir(root: Path, ws: str, conf) -> Path:
     d.mkdir(parents=True, exist_ok=True)
     for f in ("python", "constraints.txt"):
         (d / f).write_text("")
+    (d / "ohne").write_text("\n".join(conf.get("ohne", [])) + "\n")
     streng = d / "streng"
     if conf.get("streng"):
         streng.write_text("1")
@@ -277,7 +283,7 @@ def run_local(root: Path, conf, extra, timeout):
         return subprocess.run(full, cwd=wd, env=env).returncode
     # Aufgeteilt: je Teil ein Prozess mit eigenem TMPDIR, die Drosselung gilt für alle zusammen nicht,
     # deshalb je Teil ein eigener Scope mit anteiliger Quote.
-    parts = split_files(wd, conf["dateien"], conf["teile"])
+    parts = split_files(wd, conf["dateien"], conf["teile"], conf["ohne"])
     quota = max(100, 400 // len(parts))
     if pre:
         full = [x if x != "CPUQuota=400%" else f"CPUQuota={quota}%" for x in full]
@@ -340,6 +346,8 @@ def main():
             over["TEST_TEILE"] = next(it)
         elif a == "--prod-venv":
             over["TEST_PROD_VENV"] = next(it)
+        elif a == "--ohne":
+            over.setdefault("_ohne", []).append(next(it))
         elif a == "--streng":
             over["TEST_STRENG"] = "1"
         else:
