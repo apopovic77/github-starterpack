@@ -162,6 +162,9 @@ def prepare_python(workdir: Path, req_files, out, extra_pip=()):
     ver = subprocess.run([py, "-c", "import sys;print('%d.%d'%sys.version_info[:2])"],
                          capture_output=True, text=True).stdout.strip()
     present = [r for r in req_files if (workdir / r).is_file()]
+    if "requirements.lock" in present and "requirements.txt" in present:
+        # Mit Lockdatei installiert die CI nur diese (issue-api #2140); requirements.txt ist dann ungenau.
+        present.remove("requirements.txt")
     extra = sorted(set(extra_pip))
     key = f"py{ver}-" + hashlib.sha256((sha_files(workdir, present) + "|" + " ".join(extra)).encode()).hexdigest()[:16]
     venv = CACHE / "venv" / key
@@ -326,7 +329,7 @@ def execute(run_id, meta, root, workdir, setup, command, timeout, wait_max, out)
                 if bad:
                     log(out, f"TEST_PIP: ungültige Angabe {bad[0]!r} (nur Paket[extra]==Version)")
                     raise SystemExit(2)
-                env.update(prepare_python(workdir, ["requirements.txt", "requirements-dev.txt",
+                env.update(prepare_python(workdir, ["requirements.lock", "requirements.txt", "requirements-dev.txt",
                                                     "requirements-test.txt"], out, extra))
             elif setup == "node":
                 env.update(prepare_node(workdir, out))
