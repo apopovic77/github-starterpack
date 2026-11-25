@@ -47,6 +47,14 @@ TEST_WAIT=600
 Ohne Datei: `requirements.txt` ergibt Python mit `python -m pytest -q`, eine `package.json` mit
 `test`-Skript ergibt Node mit `npm test --`.
 
+### Testabhängigkeiten
+
+- **Python:** `pytest` und `pytest-xdist` sind immer dabei. Was die Tests sonst brauchen, etwa
+  `pytest-asyncio`, gehört in `requirements-test.txt` oder `requirements-dev.txt` neben
+  `requirements.txt`. Beide Dateien fließen in den Cache-Schlüssel ein.
+- **Node:** Private Pakete aus GitHub Packages (z. B. `@arkturian/…`) brauchen auf studio einen
+  Lese-Token. `.npmrc` geht nie mit. Ohne Token bricht `npm ci` mit 401 ab.
+
 ### Was nie mitgeht
 
 `.git`, `node_modules`, `.venv`, `venv`, `.env*`, `*.key`, `*.pem`, `*.p12`, `secrets/`,
