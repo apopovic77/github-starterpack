@@ -41,8 +41,13 @@ oder 75 (alle Plätze länger als `TEST_WAIT` belegt).
 TEST_DIR=backend
 TEST_SETUP=python
 TEST_CMD=python -m pytest -q -n 8
+TEST_PIP=pytest-asyncio==1.3.0 greenlet
 TEST_WAIT=600
 ```
+
+`TEST_PIP` sind zusätzliche Pakete für die Python-Umgebung auf studio. Erlaubt sind nur Paketnamen,
+optional mit Extras und Versionsangabe, keine Optionen, URLs oder Pfade. Sie fließen in den
+Cache-Schlüssel ein.
 
 Ohne Datei: `requirements.txt` ergibt Python mit `python -m pytest -q`, eine `package.json` mit
 `test`-Skript ergibt Node mit `npm test --`.
@@ -51,7 +56,10 @@ Ohne Datei: `requirements.txt` ergibt Python mit `python -m pytest -q`, eine `pa
 
 - **Python:** `pytest` und `pytest-xdist` sind immer dabei. Was die Tests sonst brauchen, etwa
   `pytest-asyncio`, gehört in `requirements-test.txt` oder `requirements-dev.txt` neben
-  `requirements.txt`. Beide Dateien fließen in den Cache-Schlüssel ein.
+  `requirements.txt` oder in `TEST_PIP`. Alles fließt in den Cache-Schlüssel ein.
+- **Offene Dateien:** macOS erlaubt einem Prozess standardmäßig 256. studio-ci hebt das je Lauf an
+  (bis 65536), sonst brechen größere Suiten mit `Errno 24` ab.
+- **Tests, die kein pytest sind** (eigenständige Skripte wie bei issue-api): `TEST_CMD` setzen.
 - **Node:** Private Pakete aus GitHub Packages (z. B. `@arkturian/…`) brauchen auf studio einen
   Lese-Token. `.npmrc` geht nie mit. Ohne Token bricht `npm ci` mit 401 ab.
 

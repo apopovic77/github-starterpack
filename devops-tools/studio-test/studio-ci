@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 import re
+import resource
 import shlex
 import shutil
 import signal
@@ -140,12 +141,29 @@ def log(out, msg):
     out.flush()
 
 
-def prepare_python(workdir: Path, req_files, out):
+def repo_conf(root: Path) -> dict:
+    """Liest .devops/studio-test.conf aus dem Arbeitsbereich (nur KEY=Wert, nichts wird ausgeführt)."""
+    conf = {}
+    p = root / ".devops" / "studio-test.conf"
+    if p.is_file():
+        for line in p.read_text(errors="replace").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                conf[k.strip()] = v.strip()
+    return conf
+
+
+PIP_SPEC_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*(\[[A-Za-z0-9,._-]+\])?([<>=!~]=?[A-Za-z0-9.*+_-]+(,[<>=!~]=?[A-Za-z0-9.*+_-]+)*)?$")
+
+
+def prepare_python(workdir: Path, req_files, out, extra_pip=()):
     py = first_existing(PY_CANDIDATES)
     ver = subprocess.run([py, "-c", "import sys;print('%d.%d'%sys.version_info[:2])"],
                          capture_output=True, text=True).stdout.strip()
     present = [r for r in req_files if (workdir / r).is_file()]
-    key = f"py{ver}-" + sha_files(workdir, present)
+    extra = sorted(set(extra_pip))
+    key = f"py{ver}-" + hashlib.sha256((sha_files(workdir, present) + "|" + " ".join(extra)).encode()).hexdigest()[:16]
     venv = CACHE / "venv" / key
     with Lock(CACHE / "venv" / f"{key}.lock"):
         if not (venv / ".fertig").exists():
@@ -161,7 +179,7 @@ def prepare_python(workdir: Path, req_files, out):
                     log(out, f"pip install -r {r} fehlgeschlagen (rc={rc}), Umgebung wird nicht gespeichert")
                     shutil.rmtree(venv, ignore_errors=True)
                     raise SystemExit(rc)
-            subprocess.run(pip + ["pytest", "pytest-xdist"], check=True, stdout=out, stderr=out)
+            subprocess.run(pip + ["pytest", "pytest-xdist"] + extra, check=True, stdout=out, stderr=out)
             (venv / ".fertig").write_text(str(int(time.time())))
             log(out, f"Python-Umgebung fertig in {time.time() - t0:.0f} s")
     return {"VIRTUAL_ENV": str(venv), "PATH": f"{venv}/bin:" + BREW_PATH}
@@ -196,6 +214,20 @@ def prepare_node(workdir: Path, out):
         subprocess.run(["/bin/cp", "-cR", str(cached / "node_modules"), str(workdir / "node_modules")], check=True)
         marker.write_text(key)
     return {"PATH": f"{workdir}/node_modules/.bin:" + BREW_PATH}
+
+
+def raise_nofile(out):
+    """macOS gibt Prozessen 256 offene Dateien; größere Suiten brechen dann mit Errno 24 ab."""
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    for want in (65536, 24576, 10240, 4096):
+        if want <= soft:
+            return
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (want if hard == resource.RLIM_INFINITY else min(want, hard), hard))
+            return
+        except (ValueError, OSError):
+            continue
+    log(out, f"offene Dateien bleiben bei {soft}")
 
 
 # --------------------------------------------------------------------------- Slots
@@ -289,10 +321,16 @@ def execute(run_id, meta, root, workdir, setup, command, timeout, wait_max, out)
                    "TMPDIR": str(CI / "tmp"), "PATH": BREW_PATH}
             (CI / "tmp").mkdir(exist_ok=True)
             if setup == "python":
+                extra = repo_conf(root).get("TEST_PIP", "").split()
+                bad = [x for x in extra if not PIP_SPEC_RE.match(x)]
+                if bad:
+                    log(out, f"TEST_PIP: ungültige Angabe {bad[0]!r} (nur Paket[extra]==Version)")
+                    raise SystemExit(2)
                 env.update(prepare_python(workdir, ["requirements.txt", "requirements-dev.txt",
-                                                    "requirements-test.txt"], out))
+                                                    "requirements-test.txt"], out, extra))
             elif setup == "node":
                 env.update(prepare_node(workdir, out))
+            raise_nofile(out)
             t0 = time.time()
             p = subprocess.Popen(["/usr/bin/nice", "-n", str(NICE)] + command, cwd=workdir, env=env,
                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
