@@ -20,6 +20,12 @@ Konfiguration je Repo in .devops/studio-test.conf (Zeilen KEY=Wert, alles option
     TEST_SETUP=python|node|none          Abhängigkeiten vorbereiten (Vorgabe: erkannt)
     TEST_CMD=python -m pytest -q -n 8    Befehl (Vorgabe: erkannt); Testargumente hängen dahinter
     TEST_WAIT=600                        so lange auf einen freien Platz warten, sonst lokal
+    TEST_PIP=paket==1.2 …                zusätzliche Testpakete (nur Name[extra] und Version)
+    TEST_PROD_VENV=/var/www/x/venv|aus   venv der Produktion für den Abgleich (Vorgabe: erkannt)
+
+Abgleich mit Produktion (Python): Gibt es auf arkserver /var/www/<repo>/venv, gehen ihre Python-Version und
+ihre Paketversionen mit. studio baut die Umgebung dann mit denselben Versionen; passen sie nicht zum Stand,
+ohne Vorgabe, mit Hinweis in der Ausgabe.
 
 Ohne Konfiguration: requirements.txt → python -m pytest -q, package.json mit "test" → npm test --.
 Nie mitgeschickt: .git, node_modules, .venv/venv, .env*, *.key, *.pem, secrets/, alles aus .gitignore.
@@ -38,7 +44,7 @@ HOST = os.environ.get("STUDIO_TEST_HOST", "studio-ci")
 SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ControlMaster=auto",
             "-o", "ControlPath=~/.ssh/cm-studio-test-%C", "-o", "ControlPersist=15m",
             "-o", "ServerAliveInterval=20"]
-EXCLUDES = [".git/", "node_modules/", ".venv/", "venv/", "__pycache__/", ".pytest_cache/", ".env",
+EXCLUDES = [".git", "node_modules/", ".venv/", "venv/", "__pycache__/", ".pytest_cache/", ".env",
             ".env.*", "*.key", "*.pem", "*.p12", "secrets/", ".secrets/", "*.db", "*.sqlite",
             "*.sqlite3", "dist/", "build/", ".derived-data/", "DerivedData/", ".npmrc", ".pypirc"]
 LOGDIR = Path.home() / ".cache" / "studio-test"
@@ -109,16 +115,71 @@ def load_conf(root: Path, over=None):
             cmd = "npm test --"
         else:
             sys.exit("studio-test: Testbefehl unbekannt, .devops/studio-test.conf mit TEST_CMD anlegen")
-    return {"sub": sub, "setup": setup, "cmd": shlex.split(cmd), "wait": int(conf.get("TEST_WAIT", "600"))}
+    return {"sub": sub, "setup": setup, "cmd": shlex.split(cmd), "wait": int(conf.get("TEST_WAIT", "600")),
+            "prod_venv": conf.get("TEST_PROD_VENV", "")}
 
 
-def sync(root: Path, ws: str, dry):
+def repo_name(root: Path) -> str:
+    try:
+        url = subprocess.check_output(["git", "-C", str(root), "remote", "get-url", "origin"], text=True,
+                                      stderr=subprocess.DEVNULL).strip()
+        name = re.sub(r"\.git$", "", url.rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1])
+        if name:
+            return name
+    except subprocess.CalledProcessError:
+        pass
+    return root.name
+
+
+def prod_venv(root: Path, conf) -> Path:
+    want = conf.get("prod_venv", "")
+    if want == "aus":
+        return None
+    cands = [Path(want)] if want else [Path(f"/var/www/{n}/{v}") for n in (repo_name(root), f"{repo_name(root)}.arkturian.com")
+                                       for v in ("venv", ".venv")]
+    for c in cands:
+        if (c / "bin" / "python").exists():
+            return c
+    return None
+
+
+def abgleich_dir(root: Path, ws: str, conf) -> Path:
+    """Erzeugt ~/.cache/studio-test/abgleich/<ws>/.studio-test mit python und constraints.txt."""
+    d = LOGDIR / "abgleich" / ws / ".studio-test"
+    d.mkdir(parents=True, exist_ok=True)
+    for f in ("python", "constraints.txt"):
+        (d / f).write_text("")
+    if conf["setup"] != "python":
+        return d
+    v = prod_venv(root, conf)
+    if not v:
+        return d
+    py = str(v / "bin" / "python")
+    code = ("import sys, importlib.metadata as m\n"
+            "print('%d.%d' % sys.version_info[:2])\n"
+            "seen = set()\n"
+            "for x in m.distributions():\n"
+            "    n = (x.metadata.get('Name') or '').strip()\n"
+            "    if n and n.lower() not in seen:\n"
+            "        seen.add(n.lower()); print(f'{n}=={x.version}')\n")
+    try:
+        out = subprocess.run([py, "-I", "-c", code], capture_output=True, text=True, timeout=30).stdout.splitlines()
+    except Exception:
+        return d
+    if out:
+        (d / "python").write_text(out[0].strip() + "\n")
+        (d / "constraints.txt").write_text("\n".join(sorted(out[1:], key=str.lower)) + "\n")
+        conf["abgleich"] = f"{v} (Python {out[0].strip()}, {len(out) - 1} Pakete)"
+    return d
+
+
+def sync(root: Path, ws: str, dry, extra_src: Path = None):
     args = ["rsync", "-az", "--delete", "--max-size=50m", "--filter=:- .gitignore"]
     args += [f"--exclude={e}" for e in EXCLUDES]
     args += ["-e", "ssh " + " ".join(shlex.quote(o) for o in SSH_OPTS)]
     if dry:
         args += ["--dry-run", "-v"]  # kein --itemize-changes: das Gate lässt --log-format nicht durch
-    args += [f"{root}/", f"{HOST}:ws/{ws}/"]
+    args += [f"{root}/"] + ([str(extra_src)] if extra_src else []) + [f"{HOST}:ws/{ws}/"]
     t0 = time.time()
     rc = subprocess.run(args).returncode
     return rc, time.time() - t0
@@ -197,7 +258,8 @@ def main():
     if local:
         return run_local(root, conf, extra, timeout)
 
-    rc, dt = sync(root, ws, dry)
+    extra_src = abgleich_dir(root, ws, conf)
+    rc, dt = sync(root, ws, dry, extra_src)
     if dry:
         say(f"würde ausführen in {conf['sub']} ({conf['setup']}): {' '.join(conf['cmd'] + extra)}")
         return rc
@@ -207,7 +269,8 @@ def main():
     if rc != 0:
         say(f"Abgleich fehlgeschlagen (rsync rc={rc})")
         return rc
-    say(f"Abgleich {dt:.1f} s → studio:{ws}")
+    say(f"Abgleich {dt:.1f} s → studio:{ws}"
+        + (f" · Versionen wie Produktion: {conf['abgleich']}" if conf.get("abgleich") else ""))
 
     remote = ["studio-ci", "run", ws, conf["sub"], conf["setup"], str(timeout), str(conf["wait"]),
               "1" if detach else "0", "--"] + conf["cmd"] + extra

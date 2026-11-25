@@ -157,8 +157,36 @@ def repo_conf(root: Path) -> dict:
 PIP_SPEC_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*(\[[A-Za-z0-9,._-]+\])?([<>=!~]=?[A-Za-z0-9.*+_-]+(,[<>=!~]=?[A-Za-z0-9.*+_-]+)*)?$")
 
 
-def prepare_python(workdir: Path, req_files, out, extra_pip=()):
-    py = first_existing(PY_CANDIDATES)
+PYVER_RE = re.compile(r"^3\.[0-9]{1,2}$")
+FREEZE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*==[A-Za-z0-9.+!_-]+$")
+
+
+def pick_python(want: str, out):
+    """Python wie in Produktion (z. B. 3.11), sonst das neueste vorhandene."""
+    if want and PYVER_RE.match(want):
+        for base in ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"):
+            cand = f"{base}/python{want}"
+            if os.path.exists(cand):
+                return cand
+        log(out, f"Python {want} wie in Produktion fehlt auf studio, nehme {first_existing(PY_CANDIDATES)}")
+    return first_existing(PY_CANDIDATES)
+
+
+def read_abgleich(root: Path):
+    """Von studio-test mitgeschickt: .studio-test/python und .studio-test/constraints.txt (pip freeze der
+    Produktions-venv auf arkserver). Nur Zeilen Paket==Version werden genommen."""
+    d = root / ".studio-test"
+    want = (d / "python").read_text().strip() if (d / "python").is_file() else ""
+    cons = []
+    if (d / "constraints.txt").is_file():
+        cons = [ln.strip() for ln in (d / "constraints.txt").read_text(errors="replace").splitlines()
+                if FREEZE_RE.match(ln.strip())]
+    return want, sorted(set(cons))
+
+
+def prepare_python(workdir: Path, req_files, out, extra_pip=(), root: Path = None):
+    want, cons = read_abgleich(root or workdir)
+    py = pick_python(os.environ.get("STUDIO_CI_PYTHON", "") or want, out)
     ver = subprocess.run([py, "-c", "import sys;print('%d.%d'%sys.version_info[:2])"],
                          capture_output=True, text=True).stdout.strip()
     present = [r for r in req_files if (workdir / r).is_file()]
@@ -166,26 +194,49 @@ def prepare_python(workdir: Path, req_files, out, extra_pip=()):
         # Mit Lockdatei installiert die CI nur diese (issue-api #2140); requirements.txt ist dann ungenau.
         present.remove("requirements.txt")
     extra = sorted(set(extra_pip))
-    key = f"py{ver}-" + hashlib.sha256((sha_files(workdir, present) + "|" + " ".join(extra)).encode()).hexdigest()[:16]
+    key = f"py{ver}-" + hashlib.sha256((sha_files(workdir, present) + "|" + " ".join(extra) + "|"
+                                        + "\n".join(cons)).encode()).hexdigest()[:16]
     venv = CACHE / "venv" / key
     with Lock(CACHE / "venv" / f"{key}.lock"):
         if not (venv / ".fertig").exists():
             t0 = time.time()
-            log(out, f"neue Python-Umgebung {key} (einmalig je Abhängigkeitsstand)")
-            shutil.rmtree(venv, ignore_errors=True)
-            subprocess.run([py, "-m", "venv", str(venv)], check=True)
-            pip = [str(venv / "bin" / "python"), "-m", "pip", "install", "-q", "--disable-pip-version-check"]
-            subprocess.run(pip + ["-U", "pip", "wheel"], check=True, stdout=out, stderr=out)
-            for r in present:
-                rc = subprocess.run(pip + ["-r", str(workdir / r)], stdout=out, stderr=out).returncode
-                if rc != 0:
-                    log(out, f"pip install -r {r} fehlgeschlagen (rc={rc}), Umgebung wird nicht gespeichert")
-                    shutil.rmtree(venv, ignore_errors=True)
-                    raise SystemExit(rc)
-            subprocess.run(pip + ["pytest", "pytest-xdist"] + extra, check=True, stdout=out, stderr=out)
+            log(out, f"neue Python-Umgebung {key} (Python {ver}, {len(cons)} Versionen aus Produktion)")
+            ok = build_venv(py, venv, workdir, present, extra, cons, out)
+            if not ok and cons:
+                log(out, "Versionen aus Produktion passen nicht zu diesem Stand, baue ohne Vorgabe")
+                ok = build_venv(py, venv, workdir, present, extra, [], out)
+                if ok:
+                    (venv / ".ohne-abgleich").write_text("1")
+            if not ok:
+                shutil.rmtree(venv, ignore_errors=True)
+                raise SystemExit(1)
             (venv / ".fertig").write_text(str(int(time.time())))
             log(out, f"Python-Umgebung fertig in {time.time() - t0:.0f} s")
+        elif (venv / ".ohne-abgleich").exists():
+            log(out, "Hinweis: Umgebung ohne Versionen aus Produktion (sie passten nicht zu diesem Stand)")
     return {"VIRTUAL_ENV": str(venv), "PATH": f"{venv}/bin:" + BREW_PATH}
+
+
+def build_venv(py, venv: Path, workdir: Path, present, extra, cons, out) -> bool:
+    shutil.rmtree(venv, ignore_errors=True)
+    subprocess.run([py, "-m", "venv", str(venv)], check=True)
+    pip = [str(venv / "bin" / "python"), "-m", "pip", "install", "-q", "--disable-pip-version-check"]
+    subprocess.run(pip + ["-U", "pip", "wheel"], check=True, stdout=out, stderr=out)
+    if cons:
+        cfile = venv / "constraints.txt"
+        cfile.write_text("\n".join(cons) + "\n")
+        pip = pip + ["-c", str(cfile)]
+    for r in present:
+        rc = subprocess.run(pip + ["-r", str(workdir / r)], stdout=out, stderr=out).returncode
+        if rc != 0:
+            log(out, f"pip install -r {r} fehlgeschlagen (rc={rc})")
+            return False
+    # pytest selbst nicht an Produktion binden: dort fehlt es meist, die Vorgabe greift dann ohnehin nicht.
+    rc = subprocess.run(pip + ["pytest", "pytest-xdist"] + list(extra), stdout=out, stderr=out).returncode
+    if rc != 0:
+        log(out, f"pip install pytest/TEST_PIP fehlgeschlagen (rc={rc})")
+        return False
+    return True
 
 
 def prepare_node(workdir: Path, out):
@@ -330,7 +381,7 @@ def execute(run_id, meta, root, workdir, setup, command, timeout, wait_max, out)
                     log(out, f"TEST_PIP: ungültige Angabe {bad[0]!r} (nur Paket[extra]==Version)")
                     raise SystemExit(2)
                 env.update(prepare_python(workdir, ["requirements.lock", "requirements.txt", "requirements-dev.txt",
-                                                    "requirements-test.txt"], out, extra))
+                                                    "requirements-test.txt"], out, extra, root=root))
             elif setup == "node":
                 env.update(prepare_node(workdir, out))
             raise_nofile(out)
