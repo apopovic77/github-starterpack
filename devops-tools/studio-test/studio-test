@@ -149,6 +149,13 @@ def abgleich_dir(root: Path, ws: str, conf) -> Path:
     d.mkdir(parents=True, exist_ok=True)
     for f in ("python", "constraints.txt"):
         (d / f).write_text("")
+    # Versionierte Dateien (NUL-getrennt): studio-ci baut daraus einen Git-Index ohne Verlauf, damit
+    # Tests mit `git ls-files` laufen. .git selbst geht nie mit.
+    try:
+        tracked = subprocess.run(["git", "-C", str(root), "ls-files", "-z"], capture_output=True, timeout=30).stdout
+    except Exception:
+        tracked = b""
+    (d / "tracked").write_bytes(tracked)
     if conf["setup"] != "python":
         return d
     v = prod_venv(root, conf)

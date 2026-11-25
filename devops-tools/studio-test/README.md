@@ -127,6 +127,14 @@ Host studio-ci
   IdentitiesOnly yes
 ```
 
+### Git im Arbeitsbereich
+
+`.git` geht nie mit. Damit Tests mit `git ls-files` trotzdem laufen, schickt `studio-test` die Liste
+der versionierten Dateien mit (`.studio-test/tracked`). studio-ci baut daraus vor jedem Lauf einen
+Git-Index ohne Verlauf. Dateien, die nicht übertragen wurden (etwa `.env`), fehlen darin. `git log`,
+`git diff` und `git blame` liefern dort nichts; Tests, die den Verlauf brauchen, gehören auf
+`--local`.
+
 ### Grenzen
 
 - **Gate:** Es erlaubt nur rsync als Empfänger in `~/ci/ws/<name>/` sowie `studio-ci run|status|log|ping`.
