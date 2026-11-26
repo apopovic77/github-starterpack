@@ -97,6 +97,15 @@ in dieser Reihenfolge (#4064):
     "abweichung": [{"host": "arkserver", "venv": "…", "python": "3.11", "anders": ["fastapi==0.141.1"]}]}
    ```
    Die Ausgabe nennt Rechner, Pfad und Stand, jede Abweichung als eigene Zeile.
+
+   **Sammler** (`prod-pakete-sammler`, root auf arkserver, Timer alle 6 h um :20): Je Dienst aus `kern.json`
+   liest er auf dem Zielrechner den laufenden Prozess der Unit (MainPID). Das venv kommt aus argv,
+   `VIRTUAL_ENV` oder den geladenen site-packages, die Pakete aus `importlib.metadata` dieses venv. Den
+   eigenen Rechner (kurzer Hostname, `--lokal`) fragt er ohne ssh ab. Der Dateiname ist der Basisname von
+   `origin` im Dienstverzeichnis, sonst der Dienstname. Ein Dienst ohne Python-venv wird übersprungen.
+   Scheitert eine Abfrage, bleibt die alte Datei stehen und veraltet. `--trocken` gibt nur aus.
+   Einrichten: `install -m 0755 prod-pakete-sammler /usr/local/sbin/`, die `.service`- und `.timer`-Datei
+   nach `/etc/systemd/system/`, dann `systemctl enable --now prod-pakete-sammler.timer`.
 3. Rückfall: die venv auf arkserver (`/var/www/<repo>/venv`, `.venv` oder `/var/www/<repo>.arkturian.com/venv`;
    der Name kommt aus der Adresse von `origin`). Die Ausgabe sagt dann „Rückfall arkserver-venv“.
 

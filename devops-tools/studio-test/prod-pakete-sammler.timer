@@ -1,0 +1,11 @@
+# Alle 6 h um :20, also ausserhalb der Release-Fenster :43-:57. studio-test nimmt eine Datei bis 48 h
+# Alter an, ein ausgefallener Lauf faellt also nicht auf.
+[Unit]
+Description=prod-pakete-sammler alle 6 h (#4064)
+
+[Timer]
+OnCalendar=*-*-* 00/6:20:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
