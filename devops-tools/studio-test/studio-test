@@ -1,0 +1,496 @@
+#!/usr/bin/env python3
+"""studio-test: Tests eines Repos auf studio laufen lassen statt auf arkserver. Issue #3999.
+
+    studio-test [optionen] [-- testargumente]
+    studio-test status <lauf-id>      Stand eines --detach-Laufs
+    studio-test log <lauf-id>         dessen volles Log
+    studio-test ping                  ist studio erreichbar, wie belegt
+
+Optionen:
+    --detach        nicht warten, Lauf-ID ausgeben (lange Suiten, Codex)
+    --local         gleich auf arkserver, gedrosselt (agent-tests.slice)
+    --timeout S     Zeitlimit in Sekunden (Vorgabe 1800, höchstens 1800)
+    --cmd "…"       Testbefehl für diesen Lauf statt aus der Konfiguration
+    --dir D         Unterordner für diesen Lauf (statt TEST_DIR)
+    --setup S       python|node|none für diesen Lauf (statt TEST_SETUP)
+    --teile N       Testdateien auf N parallele Prozesse verteilen (statt TEST_TEILE, 1 bis 16)
+    --prod-venv P   venv der Produktion für den Abgleich, "aus" schaltet ihn ab (statt TEST_PROD_VENV)
+    --ohne MUSTER   Datei(en) beim Aufteilen auslassen, mehrfach möglich (zu TEST_OHNE)
+    --streng        Release-Tor: Pakete genau wie in Produktion, sonst Fehler (rc 3) statt Weiterbau
+    -n, --dry-run   nur zeigen, was geschickt und ausgeführt würde
+
+Konfiguration je Repo in .devops/studio-test.conf (Zeilen KEY=Wert, alles optional):
+    TEST_DIR=backend                     Unterordner, in dem getestet wird (Vorgabe: Repo-Wurzel)
+    TEST_SETUP=python|node|none          Abhängigkeiten vorbereiten (Vorgabe: erkannt)
+    TEST_CMD=python -m pytest -q -n 8    Befehl (Vorgabe: erkannt); Testargumente hängen dahinter
+    TEST_WAIT=600                        so lange auf einen freien Platz warten, sonst lokal
+    TEST_PIP=paket==1.2 …                zusätzliche Testpakete (nur Name[extra] und Version)
+    TEST_PROD_VENV=/var/www/x/venv|aus   venv der Produktion für den Abgleich (Vorgabe: erkannt)
+    TEST_TEILE=6                         Testdateien sortiert reihum auf 6 Prozesse, je eigenes TMPDIR
+    TEST_DATEIEN=tests/test_*.py         welche Dateien verteilt werden (Muster relativ zu TEST_DIR)
+    TEST_OHNE=tests/test_x.py …          diese Dateien beim Aufteilen auslassen (Muster)
+
+Abgleich mit Produktion (Python): Python-Version und Paketversionen der Produktion gehen mit, studio baut die
+Umgebung mit denselben Versionen. Quelle in dieser Reihenfolge (#4064):
+    1. TEST_PROD_VENV bzw. --prod-venv, wenn gesetzt
+    2. /var/lib/agentos/prod-pakete/<repo>.json, vom Sammler aus dem laufenden venv des Dienstes in
+       Produktion (Rechner laut kern.json), mit Rechner, Pfad und Stand
+    3. /var/www/<repo>/venv auf arkserver (Rückfall, steht so in der Ausgabe)
+Passen die Versionen nicht zum Stand, ohne Vorgabe, mit Hinweis. Mit --streng ist eine Datei aus 2., die
+älter als 48 h oder unlesbar ist, ein Fehler (rc 3).
+
+Ohne Konfiguration: requirements.txt → python -m pytest -q, package.json mit "test" → npm test --.
+Nie mitgeschickt: .git, node_modules, .venv/venv, .env*, *.key, *.pem, secrets/, alles aus .gitignore.
+"""
+import fnmatch
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime
+from pathlib import Path
+
+HOST = os.environ.get("STUDIO_TEST_HOST", "studio-ci")
+SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ControlMaster=auto",
+            "-o", "ControlPath=~/.ssh/cm-studio-test-%C", "-o", "ControlPersist=15m",
+            "-o", "ServerAliveInterval=20"]
+# node_modules, .venv und venv ohne Schrägstrich: Sie sind in worktrees oft Symlinks, und ein Muster mit "/"
+# trifft nur Ordner. Der Link ginge sonst mit und blockiert auf studio den APFS-Klon (#3999, CloudV2).
+EXCLUDES = [".git", "node_modules", ".venv", "venv", "__pycache__/", ".pytest_cache/", ".env",
+            ".env.*", "*.key", "*.pem", "*.p12", "secrets/", ".secrets/", "*.db", "*.sqlite",
+            "*.sqlite3", "dist/", "build/", ".derived-data/", "DerivedData/", ".npmrc", ".pypirc"]
+LOGDIR = Path.home() / ".cache" / "studio-test"
+PROD_PAKETE = Path(os.environ.get("STUDIO_PROD_PAKETE", "/var/lib/agentos/prod-pakete"))
+PROD_PAKETE_MAX_H = 48
+PIN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,100}==[A-Za-z0-9][A-Za-z0-9.+!_-]{0,60}$")
+PYVER_RE = re.compile(r"^3\.[0-9]{1,2}$")
+DIENST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
+FALLBACK_RC = 75
+
+
+def say(msg):
+    sys.stderr.write(f"studio-test: {msg}\n")
+    sys.stderr.flush()
+
+
+def ssh(args, **kw):
+    return subprocess.run(["ssh"] + SSH_OPTS + [HOST] + args, **kw)
+
+
+def repo_root():
+    try:
+        return Path(subprocess.check_output(["git", "rev-parse", "--show-toplevel"], text=True,
+                                            stderr=subprocess.DEVNULL).strip())
+    except subprocess.CalledProcessError:
+        sys.exit("studio-test: kein Git-Repo")
+
+
+def agent_name():
+    for k in ("CLOUD_SESSION_NAME", "AGENT_NAME"):
+        if os.environ.get(k):
+            return os.environ[k]
+    if os.environ.get("TMUX"):
+        try:
+            return subprocess.check_output(["tmux", "display-message", "-p", "#S"], text=True).strip()
+        except Exception:
+            pass
+    return os.environ.get("USER", "agent")
+
+
+def slug(s):
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", s).strip("-.")[:60] or "x"
+
+
+def load_conf(root: Path, over=None):
+    conf = {}
+    p = root / ".devops" / "studio-test.conf"
+    if p.is_file():
+        for line in p.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                conf[k.strip()] = v.strip()
+    conf.update({k: v for k, v in (over or {}).items() if v and not k.startswith("_")})
+    sub = conf.get("TEST_DIR", ".")
+    wd = root / sub
+    setup = conf.get("TEST_SETUP")
+    cmd = conf.get("TEST_CMD")
+    if not setup:
+        if (wd / "requirements.txt").is_file():
+            setup = "python"
+        elif (wd / "package.json").is_file():
+            setup = "node"
+        else:
+            setup = "none"
+    if not cmd:
+        if setup == "python":
+            cmd = "python -m pytest -q"
+        elif setup == "node":
+            scripts = json.loads((wd / "package.json").read_text()).get("scripts", {})
+            if "test" not in scripts:
+                sys.exit("studio-test: package.json hat kein \"test\"-Skript, TEST_CMD setzen")
+            cmd = "npm test --"
+        else:
+            sys.exit("studio-test: Testbefehl unbekannt, .devops/studio-test.conf mit TEST_CMD anlegen")
+    teile = int(conf.get("TEST_TEILE", "1") or 1)
+    if not 1 <= teile <= 16:
+        sys.exit("studio-test: TEST_TEILE muss 1 bis 16 sein")
+    return {"sub": sub, "setup": setup, "cmd": shlex.split(cmd), "wait": int(conf.get("TEST_WAIT", "600")),
+            "prod_venv": conf.get("TEST_PROD_VENV", ""), "teile": teile,
+            "streng": conf.get("TEST_STRENG", "") == "1",
+            "ohne": conf.get("TEST_OHNE", "").split() + list((over or {}).get("_ohne", [])),
+            "dateien": conf.get("TEST_DATEIEN", "tests/test_*.py").split()}
+
+
+def split_files(wd: Path, muster, teile, ohne=()):
+    """Wie studio-ci: Dateien sortiert, ohne die Ausnahmen, reihum auf die Teile."""
+    files = sorted({str(f.relative_to(wd)) for m in muster for f in wd.glob(m) if f.is_file()})
+    files = [f for f in files if not any(fnmatch.fnmatch(f, o) for o in ohne)]
+    if not files:
+        sys.exit(f"studio-test: TEST_DATEIEN: keine Datei für {' '.join(muster)}")
+    return [files[k::teile] for k in range(teile) if files[k::teile]]
+
+
+def repo_name(root: Path) -> str:
+    try:
+        url = subprocess.check_output(["git", "-C", str(root), "remote", "get-url", "origin"], text=True,
+                                      stderr=subprocess.DEVNULL).strip()
+        name = re.sub(r"\.git$", "", url.rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1])
+        if name:
+            return name
+    except subprocess.CalledProcessError:
+        pass
+    return root.name
+
+
+def prod_venv(root: Path, conf) -> Path:
+    want = conf.get("prod_venv", "")
+    if want == "aus":
+        return None
+    cands = [Path(want)] if want else [Path(f"/var/www/{n}/{v}") for n in (repo_name(root), f"{repo_name(root)}.arkturian.com")
+                                       for v in ("venv", ".venv")]
+    for c in cands:
+        if (c / "bin" / "python").exists():
+            return c
+    return None
+
+
+class ProdPaketeFehler(Exception):
+    pass
+
+
+def prod_pakete(name: str):
+    """Paketstände des Dienstes aus Produktion (#4064), vom Sammler unter PROD_PAKETE/<repo>.json abgelegt.
+    None, wenn es keine Datei gibt. ProdPaketeFehler, wenn sie unlesbar, unvollständig oder zu alt ist."""
+    if not DIENST_RE.match(name):
+        return None
+    f = PROD_PAKETE / f"{name}.json"
+    if not f.exists():
+        return None
+    try:
+        data = json.loads(f.read_text())
+        quelle = data.get("quelle") or {}
+        py = str(data["python"]).strip()
+        pakete = [str(x).strip() for x in data["pakete"]]
+        stand = str(data["stand"])
+    except Exception as e:
+        raise ProdPaketeFehler(f"{f} unlesbar ({type(e).__name__})")
+    if not PYVER_RE.match(py):
+        raise ProdPaketeFehler(f"{f}: Python {py!r} ungültig")
+    falsch = [x for x in pakete if not PIN_RE.match(x)]
+    if falsch or not pakete:
+        raise ProdPaketeFehler(f"{f}: {len(falsch)} ungültige Paketzeilen" if falsch else f"{f}: keine Pakete")
+    try:
+        t = datetime.fromisoformat(stand.replace("Z", "+00:00"))
+        if t.tzinfo is None:
+            raise ValueError
+        t = t.timestamp()
+    except ValueError:
+        raise ProdPaketeFehler(f"{f}: Stand {stand!r} ungültig (ISO mit Zeitzone)")
+    alter_h = (time.time() - t) / 3600
+    if alter_h > PROD_PAKETE_MAX_H or alter_h < -1:
+        raise ProdPaketeFehler(f"{f}: Stand {stand} ist {alter_h:.0f} h alt (höchstens {PROD_PAKETE_MAX_H} h)")
+    host = re.sub(r"[^A-Za-z0-9._-]", "", str(quelle.get("host", "?")))[:60] or "?"
+    venv = re.sub(r"[^A-Za-z0-9._/-]", "", str(quelle.get("venv", "?")))[:200] or "?"
+    abw = []
+    for a in data.get("abweichung") or []:
+        if isinstance(a, dict):
+            h = re.sub(r"[^A-Za-z0-9._-]", "", str(a.get("host", "?")))[:60]
+            anders = [x for x in (a.get("anders") or []) if isinstance(x, str) and PIN_RE.match(x)]
+            abw.append(f"{h}: {' '.join(anders[:12])}{' …' if len(anders) > 12 else ''}")
+    return {"python": py, "pakete": sorted(set(pakete), key=str.lower), "abweichung": abw,
+            "quelle": f"{host}:{venv}, Stand {stand}"}
+
+
+def abgleich_dir(root: Path, ws: str, conf) -> Path:
+    """Erzeugt ~/.cache/studio-test/abgleich/<ws>/.studio-test mit python und constraints.txt."""
+    d = LOGDIR / "abgleich" / ws / ".studio-test"
+    d.mkdir(parents=True, exist_ok=True)
+    for f in ("python", "constraints.txt"):
+        (d / f).write_text("")
+    (d / "ohne").write_text("\n".join(conf.get("ohne", [])) + "\n")
+    streng = d / "streng"
+    if conf.get("streng"):
+        streng.write_text("1")
+    else:
+        streng.unlink(missing_ok=True)
+    # Versionierte Dateien (NUL-getrennt): studio-ci baut daraus einen Git-Index ohne Verlauf, damit
+    # Tests mit `git ls-files` laufen. .git selbst geht nie mit.
+    try:
+        tracked = subprocess.run(["git", "-C", str(root), "ls-files", "-z"], capture_output=True, timeout=30).stdout
+    except Exception:
+        tracked = b""
+    (d / "tracked").write_bytes(tracked)
+    if conf["setup"] != "python":
+        return d
+    if not conf.get("prod_venv"):  # ausdrücklich gesetzt (Pfad oder "aus") geht vor
+        try:
+            pp = prod_pakete(repo_name(root))
+        except ProdPaketeFehler as e:
+            if conf.get("streng"):
+                say(f"Paketstände aus Produktion: {e}, streng: Abbruch, rc=3")
+                sys.exit(3)
+            say(f"Paketstände aus Produktion: {e}, Rückfall arkserver-venv")
+            pp = None
+            conf["pp_grund"] = "Datei unbrauchbar"
+        if pp:
+            (d / "python").write_text(pp["python"] + "\n")
+            (d / "constraints.txt").write_text("\n".join(pp["pakete"]) + "\n")
+            conf["abgleich"] = f"{pp['quelle']} (Python {pp['python']}, {len(pp['pakete'])} Pakete)"
+            for a in pp["abweichung"]:
+                say(f"Produktion abweichend auf {a}")
+            return d
+    v = prod_venv(root, conf)
+    if not v:
+        return d
+    py = str(v / "bin" / "python")
+    code = ("import sys, importlib.metadata as m\n"
+            "print('%d.%d' % sys.version_info[:2])\n"
+            "seen = set()\n"
+            "for x in m.distributions():\n"
+            "    n = (x.metadata.get('Name') or '').strip()\n"
+            "    if n and n.lower() not in seen:\n"
+            "        seen.add(n.lower()); print(f'{n}=={x.version}')\n")
+    try:
+        out = subprocess.run([py, "-I", "-c", code], capture_output=True, text=True, timeout=30).stdout.splitlines()
+    except Exception:
+        return d
+    if out:
+        (d / "python").write_text(out[0].strip() + "\n")
+        (d / "constraints.txt").write_text("\n".join(sorted(out[1:], key=str.lower)) + "\n")
+        rueck = "" if conf.get("prod_venv") else \
+            f", Rückfall arkserver-venv, {conf.get('pp_grund') or 'keine Datei in ' + str(PROD_PAKETE)}"
+        conf["abgleich"] = f"arkserver:{v} (Python {out[0].strip()}, {len(out) - 1} Pakete{rueck})"
+    return d
+
+
+# Datenbank-Muster schließen lokale Daten aus. Versionierte Dateien dieser Art sind Testdaten (Fixtures)
+# und gehen mit; sie liegen ohnehin im Repo. Schlüssel, .env und secrets/ bleiben immer draußen.
+DATA_PATTERNS = (".db", ".sqlite", ".sqlite3")
+
+
+def tracked_data_includes(root: Path):
+    try:
+        out = subprocess.run(["git", "-C", str(root), "ls-files", "-z"], capture_output=True, timeout=30).stdout
+    except Exception:
+        return []
+    inc = []
+    for raw in out.split(b"\0"):
+        rel = raw.decode("utf-8", "surrogateescape")
+        if rel.endswith(DATA_PATTERNS) and not re.search(r"[\[\]*?\\]", rel) and (root / rel).is_file():
+            inc.append(f"--include=/{rel}")
+    return inc
+
+
+def sync(root: Path, ws: str, dry, extra_src: Path = None):
+    args = ["rsync", "-az", "--delete", "--max-size=50m"] + tracked_data_includes(root) + ["--filter=:- .gitignore"]
+    args += [f"--exclude={e}" for e in EXCLUDES]
+    args += ["-e", "ssh " + " ".join(shlex.quote(o) for o in SSH_OPTS)]
+    if dry:
+        args += ["--dry-run", "-v"]  # kein --itemize-changes: das Gate lässt --log-format nicht durch
+    args += [f"{root}/"] + ([str(extra_src)] if extra_src else []) + [f"{HOST}:ws/{ws}/"]
+    t0 = time.time()
+    rc = subprocess.run(args).returncode
+    return rc, time.time() - t0
+
+
+def fallback(root: Path, conf, extra, timeout, rc, grund):
+    """Rückfall auf arkserver. Im strengen Modus nicht: Die lokale Umgebung ist nicht die geprüfte, der
+    Aufrufer (Pipeline) bekommt rc 255 bzw. 75 und rechnet selbst mit seiner eigenen Umgebung."""
+    if conf.get("streng"):
+        say(f"{grund}, streng: kein Rückfall, rc={rc}")
+        return rc
+    say(f"{grund}, Rückfall auf arkserver")
+    return run_local(root, conf, extra, timeout)
+
+
+def run_local(root: Path, conf, extra, timeout):
+    wd = root / conf["sub"]
+    cmd = conf["cmd"] + extra
+    say(f"läuft auf arkserver, gedrosselt (agent-tests.slice): {' '.join(cmd)}")
+    base = ["systemd-run", "--user", "--scope", "--quiet", "--slice=agent-tests.slice",
+            "-p", "CPUQuota=400%", "-p", "MemoryMax=6G"]
+    penv = dict(os.environ)
+    # Agenten-Panes haben oft kein XDG_RUNTIME_DIR; ohne findet systemd-run --user den Manager nicht.
+    penv.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    probe = subprocess.run(base + ["true"], capture_output=True, env=penv)
+    pre = base if probe.returncode == 0 else []
+    if not pre:
+        say("systemd-run --user nicht verfügbar, nur nice/ionice")
+    full = pre + ["nice", "-n", "15", "ionice", "-c3", "timeout", str(timeout)] + cmd
+    env = dict(penv)
+    if conf["setup"] == "python":
+        for v in (".venv", "venv"):
+            if (wd / v / "bin" / "python").exists():
+                env["PATH"] = f"{wd / v / 'bin'}:" + env["PATH"]
+                env["VIRTUAL_ENV"] = str(wd / v)
+                break
+    elif conf["setup"] == "node":
+        env["PATH"] = f"{wd / 'node_modules' / '.bin'}:" + env["PATH"]
+    # Auf arkserver heißt der Interpreter ohne venv nur python3.
+    i = full.index(cmd[0], len(full) - len(cmd))
+    if full[i] == "python" and not shutil.which("python", path=env["PATH"]):
+        full[i] = "python3"
+    if conf["teile"] <= 1:
+        return subprocess.run(full, cwd=wd, env=env).returncode
+    # Aufgeteilt: je Teil ein Prozess mit eigenem TMPDIR, die Drosselung gilt für alle zusammen nicht,
+    # deshalb je Teil ein eigener Scope mit anteiliger Quote.
+    parts = split_files(wd, conf["dateien"], conf["teile"], conf["ohne"])
+    quota = max(100, 400 // len(parts))
+    if pre:
+        full = [x if x != "CPUQuota=400%" else f"CPUQuota={quota}%" for x in full]
+    t0 = time.time()
+    procs = []
+    with tempfile.TemporaryDirectory(prefix="studio-test-teile-") as tmp:
+        for k, files in enumerate(parts, 1):
+            td = Path(tmp) / f"teil{k}"
+            td.mkdir()
+            logp = td.with_suffix(".log")
+            procs.append((k, subprocess.Popen(full + files, cwd=wd, env={**env, "TMPDIR": str(td), "STUDIO_TEIL": str(k)},
+                                              stdout=open(logp, "wb"), stderr=subprocess.STDOUT), logp, len(files)))
+        say(f"{len(parts)} Teile gestartet")
+        rcs = []
+        for k, p, logp, n in procs:
+            rc = p.wait()
+            rcs.append(rc)
+            text = logp.read_text(errors="replace").splitlines()
+            say(f"Teil {k}/{len(parts)} rc={rc} nach {time.time() - t0:.0f} s ({n} Dateien)")
+            for x in [x for x in text if x.startswith(("FAILED", "ERROR"))][:50] + text[-1:]:
+                print(f"  [{k}] {x}")
+    bad = [rc for rc in rcs if rc != 0]
+    return bad[0] if bad else 0
+
+
+def main():
+    argv = sys.argv[1:]
+    if argv and argv[0] in ("status", "log", "ping"):
+        r = ssh(["studio-ci"] + argv)
+        return r.returncode
+    if argv and argv[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return 0
+    extra = []
+    if "--" in argv:
+        i = argv.index("--")
+        argv, extra = argv[:i], argv[i + 1:]
+    detach = local = dry = False
+    timeout = 1800
+    cmd_override = None
+    over = {}
+    it = iter(argv)
+    for a in it:
+        if a == "--detach":
+            detach = True
+        elif a == "--local":
+            local = True
+        elif a in ("-n", "--dry-run"):
+            dry = True
+        elif a == "--timeout":
+            timeout = min(int(next(it)), 1800)
+        elif a == "--cmd":
+            cmd_override = next(it)
+            over["TEST_CMD"] = cmd_override
+        elif a == "--dir":
+            over["TEST_DIR"] = next(it)
+        elif a == "--setup":
+            over["TEST_SETUP"] = next(it)
+        elif a == "--teile":
+            over["TEST_TEILE"] = next(it)
+        elif a == "--prod-venv":
+            over["TEST_PROD_VENV"] = next(it)
+        elif a == "--ohne":
+            over.setdefault("_ohne", []).append(next(it))
+        elif a == "--streng":
+            over["TEST_STRENG"] = "1"
+        else:
+            sys.exit(f"studio-test: unbekannte Option {a} (Testargumente nach --)")
+    root = repo_root()
+    conf = load_conf(root, over)
+    if cmd_override:
+        conf["cmd"] = shlex.split(cmd_override)
+    ws = slug(f"{agent_name()}-{root.name}")
+    if conf["teile"] > 1:
+        wd = root / conf["sub"]
+        pfade = [a for a in extra if not a.startswith("-") and (wd / a.split("::")[0]).exists()]
+        if pfade:  # einzelne Dateien oder Tests angegeben: nicht aufteilen, sonst kämen alle Dateien dazu
+            say(f"Pfad angegeben ({pfade[0]}), ohne Aufteilung")
+            conf["teile"] = 1
+    if local:
+        return run_local(root, conf, extra, timeout)
+
+    extra_src = abgleich_dir(root, ws, conf)
+    rc, dt = sync(root, ws, dry, extra_src)
+    if dry:
+        say(f"würde ausführen in {conf['sub']} ({conf['setup']}): {' '.join(conf['cmd'] + extra)}")
+        return rc
+    if rc == 255:  # nur ssh nicht erreichbar; rc 12 (z. B. Gate lehnt ab) ist ein Fehler, kein Rückfall
+        return fallback(root, conf, extra, timeout, rc, f"studio nicht erreichbar (rsync rc={rc})")
+    if rc != 0:
+        say(f"Abgleich fehlgeschlagen (rsync rc={rc})")
+        return rc
+    say(f"Abgleich {dt:.1f} s → studio:{ws}"
+        + (f" · Versionen wie Produktion: {conf['abgleich']}" if conf.get("abgleich") else ""))
+
+    remote = ["studio-ci", "run", ws, conf["sub"], conf["setup"], str(timeout), str(conf["wait"]),
+              "1" if detach else "0"] + ([f"teile={conf['teile']}"] if conf["teile"] > 1 else []) + ["--"] \
+        + conf["cmd"] + extra
+    remote_str = " ".join(shlex.quote(x) for x in remote)
+    LOGDIR.mkdir(parents=True, exist_ok=True)
+    if detach:
+        r = ssh([remote_str], capture_output=True, text=True)
+        if r.returncode != 0:
+            sys.stderr.write(r.stderr)
+            return r.returncode
+        run_id = r.stdout.strip()
+        print(run_id)
+        say(f"läuft im Hintergrund. Stand: studio-test status {run_id} · Log: studio-test log {run_id}")
+        return 0
+    t0 = time.time()
+    logpath = LOGDIR / f"{time.strftime('%Y%m%d-%H%M%S')}-{ws}.log"
+    with open(logpath, "w") as logf:
+        p = subprocess.Popen(["ssh"] + SSH_OPTS + [HOST, remote_str], stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT)
+        for line in iter(p.stdout.readline, b""):
+            s = line.decode("utf-8", "replace")
+            sys.stdout.write(s)
+            sys.stdout.flush()
+            logf.write(s)
+        rc = p.wait()
+    if rc == FALLBACK_RC:
+        return fallback(root, conf, extra, timeout, rc, "studio voll belegt")
+    if rc == 255:
+        return fallback(root, conf, extra, timeout, rc, "Verbindung zu studio abgebrochen")
+    say(f"rc={rc} · gesamt {time.time() - t0 + dt:.1f} s · Log {logpath}")
+    return rc
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

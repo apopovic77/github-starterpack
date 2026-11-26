@@ -15,3 +15,5 @@ vendor/
 # Local overrides
 .env
 dev.env
+__pycache__/
+*.pyc

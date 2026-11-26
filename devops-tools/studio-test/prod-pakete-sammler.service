@@ -1,0 +1,16 @@
+# prod-pakete-sammler (#4064): Paketstände der Dienste aus Produktion für studio-test.
+# Installiert auf arkserver als /etc/systemd/system/prod-pakete-sammler.service, Programm unter
+# /usr/local/sbin/prod-pakete-sammler (root 0755). root, weil es per ssh (kern.json `hosts`) die
+# laufenden Prozesse der Dienste liest. Schreibt /var/lib/agentos/prod-pakete/<repo>.json (0644).
+[Unit]
+Description=prod-pakete-sammler: Paketstaende der Dienste aus Produktion fuer studio-test (#4064)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/local/sbin/prod-pakete-sammler
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=900

@@ -1,0 +1,762 @@
+#!/usr/bin/env python3
+"""studio-ci: Empfangsseite von `studio-test` auf studio (Benutzer agentos-ci). Issue #3999.
+
+Aufruf nur über den Zwangsbefehl in authorized_keys:
+    command="/Users/agentos-ci/bin/studio-ci gate",no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty ssh-ed25519 …
+
+Das Gate erlaubt genau zwei Dinge:
+  1. rsync als Empfänger in ~/ci/ws/<arbeitsbereich>/ (keine Pfadoptionen, kein Senden)
+  2. studio-ci <run|status|log|ping> mit geprüften Argumenten
+
+Grenze: Tests führen beliebigen Code des Repos aus, also auch Code als agentos-ci. Das Gate
+verhindert Shell, Portweiterleitung und Pfade außerhalb von ~/ci. Die Trennung zu allem anderen auf
+studio leistet der Benutzer agentos-ci selbst (kein Admin, kein Zugriff auf fremde Bereiche).
+authorized_keys und dieses Skript gehören deshalb root und sind für agentos-ci nicht schreibbar.
+"""
+import fcntl
+import fnmatch
+import hashlib
+import json
+import os
+import re
+import resource
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from pathlib import Path
+
+HOME = Path.home()
+CI = HOME / "ci"
+WS = CI / "ws"
+CACHE = CI / "cache"
+RUNS = CI / "runs"
+SLOTS = CI / "slots"
+MAX_SLOTS = int(os.environ.get("STUDIO_CI_SLOTS", "3"))
+NICE = int(os.environ.get("STUDIO_CI_NICE", "10"))
+MAX_TIMEOUT = 30 * 60
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
+RUN_RE = re.compile(r"^[0-9]{8}-[0-9]{6}-[0-9a-f]{6}$")
+REL_RE = re.compile(r"^(?!/)(?!.*\.\.)[A-Za-z0-9._/-]{0,200}$")
+GLOB_RE = re.compile(r"^(?!/)(?!.*\.\.)[A-Za-z0-9._/*?\[\]-]{1,200}$")
+TEILE_RE = re.compile(r"^teile=([1-9]|1[0-6])$")
+PY_CANDIDATES = ["/opt/homebrew/bin/python3.13", "/opt/homebrew/bin/python3", "/usr/bin/python3"]
+RSYNC_CANDIDATES = ["/opt/homebrew/bin/rsync", "/usr/bin/rsync"]
+BREW_PATH = "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+
+def die(msg, code=2):
+    sys.stderr.write(f"studio-ci: {msg}\n")
+    sys.exit(code)
+
+
+def first_existing(paths):
+    for p in paths:
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def ensure_dirs():
+    for d in (WS, CACHE / "venv", CACHE / "node", RUNS, SLOTS):
+        d.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+
+# --------------------------------------------------------------------------- Gate
+
+RSYNC_OK_LONG = {"--server", "--delete", "--delete-during", "--delete-after", "--delete-delay",
+                 "--ignore-errors", "--numeric-ids", "--safe-links", "--no-implied-dirs"}
+RSYNC_OK_VALUE = re.compile(r"^--(max-size|timeout|modify-window)=[0-9]+[kKmMgG]?$")
+
+
+def gate():
+    raw = os.environ.get("SSH_ORIGINAL_COMMAND", "").strip()
+    if not raw:
+        die("keine interaktive Sitzung", 1)
+    try:
+        argv = shlex.split(raw)
+    except ValueError:
+        die("Befehl nicht lesbar")
+    if argv and argv[0] in ("rsync", "/usr/bin/rsync", "/opt/homebrew/bin/rsync"):
+        gate_rsync(argv[1:])
+    elif argv and argv[0] in ("studio-ci", str(Path(__file__).resolve())):
+        sys.exit(main(argv[1:], from_gate=True) or 0)
+    else:
+        die("nicht erlaubt: " + (argv[0] if argv else ""))
+
+
+def gate_rsync(args):
+    if "--server" not in args or "--sender" in args:
+        die("rsync nur als Empfänger")
+    # Letztes Argument ist das Ziel, davor steht ".".
+    if len(args) < 3 or args[-2] != ".":
+        die("rsync: unerwartete Argumente")
+    dest = args[-1].rstrip("/")
+    m = re.fullmatch(r"ws/([A-Za-z0-9][A-Za-z0-9._-]{0,80})", dest)
+    if not m:
+        die("rsync: Ziel nur ws/<arbeitsbereich>")
+    for a in args[:-2]:
+        if a in RSYNC_OK_LONG or RSYNC_OK_VALUE.match(a):
+            continue
+        # Kurzoptionen im Server-Modus, z. B. -logDtprze.iLsfxCIvu (nach "e." folgen Fähigkeiten, kein Pfad).
+        if re.fullmatch(r"-[A-Za-z]+(\.[A-Za-z]*)?", a):
+            continue
+        die(f"rsync: Option nicht erlaubt: {a}")
+    ensure_dirs()
+    (WS / m.group(1)).mkdir(exist_ok=True, mode=0o700)
+    rsync = first_existing(RSYNC_CANDIDATES)
+    os.chdir(CI)
+    os.execv(rsync, [rsync] + args[:-1] + [dest + "/"])
+
+
+# --------------------------------------------------------------------------- Umgebung
+
+def sha_files(base: Path, names):
+    h = hashlib.sha256()
+    for n in names:
+        p = base / n
+        if p.is_file():
+            h.update(n.encode() + b"\0" + p.read_bytes() + b"\0")
+    return h.hexdigest()[:16]
+
+
+class Lock:
+    def __init__(self, path: Path):
+        self.path = path
+        self.fh = None
+
+    def __enter__(self):
+        self.fh = open(self.path, "w")
+        fcntl.flock(self.fh, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *a):
+        fcntl.flock(self.fh, fcntl.LOCK_UN)
+        self.fh.close()
+
+
+def log(out, msg):
+    out.write(f"studio-ci: {msg}\n")
+    out.flush()
+
+
+def repo_conf(root: Path) -> dict:
+    """Liest .devops/studio-test.conf aus dem Arbeitsbereich (nur KEY=Wert, nichts wird ausgeführt)."""
+    conf = {}
+    p = root / ".devops" / "studio-test.conf"
+    if p.is_file():
+        for line in p.read_text(errors="replace").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                conf[k.strip()] = v.strip()
+    return conf
+
+
+PIP_SPEC_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*(\[[A-Za-z0-9,._-]+\])?([<>=!~]=?[A-Za-z0-9.*+_-]+(,[<>=!~]=?[A-Za-z0-9.*+_-]+)*)?$")
+
+
+PYVER_RE = re.compile(r"^3\.[0-9]{1,2}$")
+FREEZE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*==[A-Za-z0-9.+!_-]+$")
+
+
+def pick_python(want: str, out):
+    """Python wie in Produktion (z. B. 3.11), sonst das neueste vorhandene."""
+    if want and PYVER_RE.match(want):
+        for base in ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"):
+            cand = f"{base}/python{want}"
+            if os.path.exists(cand):
+                return cand
+        log(out, f"Python {want} wie in Produktion fehlt auf studio, nehme {first_existing(PY_CANDIDATES)}")
+    return first_existing(PY_CANDIDATES)
+
+
+def read_abgleich(root: Path):
+    """Von studio-test mitgeschickt: .studio-test/python und .studio-test/constraints.txt (pip freeze der
+    Produktions-venv auf arkserver). Nur Zeilen Paket==Version werden genommen."""
+    d = root / ".studio-test"
+    want = (d / "python").read_text().strip() if (d / "python").is_file() else ""
+    cons = []
+    if (d / "constraints.txt").is_file():
+        cons = [ln.strip() for ln in (d / "constraints.txt").read_text(errors="replace").splitlines()
+                if FREEZE_RE.match(ln.strip())]
+    return want, sorted(set(cons))
+
+
+def pkg_name(spec: str) -> str:
+    m = re.match(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)", spec)
+    return re.sub(r"[-_.]+", "-", m.group(1)).lower() if m else ""
+
+
+TEST_REQ = ("requirements-test.txt", "requirements-dev.txt")
+
+
+def test_pins(workdir: Path, extra) -> set:
+    """Namen der Testwerkzeuge, die das Repo selbst festlegt (requirements-test/-dev, TEST_PIP). Für sie gilt
+    die Version des Repos, nicht die der Produktion (dort steht z. B. ein neueres pytest)."""
+    names = {pkg_name(x) for x in extra} | {"pytest-xdist"}
+    for r in TEST_REQ:
+        f = workdir / r
+        if f.is_file():
+            for ln in f.read_text(errors="replace").splitlines():
+                ln = ln.split("#", 1)[0].strip()
+                if ln and not ln.startswith("-"):
+                    names.add(pkg_name(ln))
+    names.discard("")
+    # Was das Repo zur Laufzeit braucht, bleibt in der Version der Produktion, auch wenn es zusätzlich in
+    # requirements-test steht (Hinweis Cloud-Operator).
+    for r in ("requirements.txt", "requirements.lock"):
+        f = workdir / r
+        if f.is_file():
+            for ln in f.read_text(errors="replace").splitlines():
+                ln = ln.split("#", 1)[0].strip()
+                if ln and not ln.startswith("-"):
+                    names.discard(pkg_name(ln))
+    return names
+
+
+def prepare_python(workdir: Path, req_files, out, extra_pip=(), root: Path = None):
+    want, cons = read_abgleich(root or workdir)
+    streng = ((root or workdir) / ".studio-test" / "streng").is_file()
+    py = pick_python(os.environ.get("STUDIO_CI_PYTHON", "") or want, out)
+    ver = subprocess.run([py, "-c", "import sys;print('%d.%d'%sys.version_info[:2])"],
+                         capture_output=True, text=True).stdout.strip()
+    present = [r for r in req_files if (workdir / r).is_file()]
+    if "requirements.lock" in present and "requirements.txt" in present:
+        # Mit Lockdatei installiert die CI nur diese (issue-api #2140); requirements.txt ist dann ungenau.
+        present.remove("requirements.txt")
+    extra = sorted(set(extra_pip))
+    pins = test_pins(workdir, extra)
+    weg = sorted(c for c in cons if pkg_name(c) in pins)
+    cons = [c for c in cons if pkg_name(c) not in pins]
+    if weg:
+        log(out, f"Testwerkzeuge in der Version des Repos statt der Produktion: {', '.join(weg)}")
+    if streng:
+        # Streng (Release-Tor): genau die Pakete der Produktion, sonst Fehler statt Weiterbau ohne Vorgabe.
+        if not cons:
+            log(out, "streng: keine Versionen aus Produktion mitgeschickt")
+            raise SystemExit(3)
+        if want and ver != want:
+            log(out, f"streng: Python {want} wie in Produktion fehlt auf studio (hier {ver})")
+            raise SystemExit(3)
+    key = f"py{ver}-" + hashlib.sha256((sha_files(workdir, present) + "|" + " ".join(extra) + "|"
+                                        + "\n".join(cons)).encode()).hexdigest()[:16]
+    venv = CACHE / "venv" / key
+    with Lock(CACHE / "venv" / f"{key}.lock"):
+        if not (venv / ".fertig").exists():
+            t0 = time.time()
+            log(out, f"neue Python-Umgebung {key} (Python {ver}, {len(cons)} Versionen aus Produktion)")
+            ok = build_venv(py, venv, workdir, present, extra, cons, out)
+            if not ok and cons and streng:
+                shutil.rmtree(venv, ignore_errors=True)
+                log(out, "streng: Die Versionen aus Produktion passen nicht zu diesem Stand, Abbruch")
+                raise SystemExit(3)
+            if not ok and cons:
+                log(out, "Versionen aus Produktion passen nicht zu diesem Stand, baue ohne Vorgabe")
+                ok = build_venv(py, venv, workdir, present, extra, [], out)
+                if ok:
+                    (venv / ".ohne-abgleich").write_text("1")
+            if not ok:
+                shutil.rmtree(venv, ignore_errors=True)
+                raise SystemExit(1)
+            (venv / ".fertig").write_text(str(int(time.time())))
+            log(out, f"Python-Umgebung fertig in {time.time() - t0:.0f} s")
+        elif (venv / ".ohne-abgleich").exists():
+            if streng:
+                log(out, "streng: Die Umgebung im Cache ist ohne Versionen aus Produktion gebaut, Abbruch")
+                raise SystemExit(3)
+            log(out, "Hinweis: Umgebung ohne Versionen aus Produktion (sie passten nicht zu diesem Stand)")
+    if cons:
+        log(out, f"Python {ver}, {len(cons)} Pakete in der Version der Produktion")
+    return {"VIRTUAL_ENV": str(venv), "PATH": f"{venv}/bin:" + BREW_PATH}
+
+
+def build_venv(py, venv: Path, workdir: Path, present, extra, cons, out) -> bool:
+    shutil.rmtree(venv, ignore_errors=True)
+    subprocess.run([py, "-m", "venv", str(venv)], check=True)
+    pip = [str(venv / "bin" / "python"), "-m", "pip", "install", "-q", "--disable-pip-version-check"]
+    subprocess.run(pip + ["-U", "pip", "wheel"], check=True, stdout=out, stderr=out)
+    if cons:
+        cfile = venv / "constraints.txt"
+        cfile.write_text("\n".join(cons) + "\n")
+        pip = pip + ["-c", str(cfile)]
+    for r in present:
+        rc = subprocess.run(pip + ["-r", str(workdir / r)], stdout=out, stderr=out).returncode
+        if rc != 0:
+            log(out, f"pip install -r {r} fehlgeschlagen (rc={rc})")
+            return False
+    # Die Vorgabe gilt auch hier: Steht pytest in der Produktions-venv, kommt dessen Version (gewollt).
+    rc = subprocess.run(pip + ["pytest", "pytest-xdist"] + list(extra), stdout=out, stderr=out).returncode
+    if rc != 0:
+        log(out, f"pip install pytest/TEST_PIP fehlgeschlagen (rc={rc})")
+        return False
+    return True
+
+
+def local_file_deps(workdir: Path, out) -> list:
+    """Relative Ziele aller "file:"-Abhängigkeiten aus package.json, nur innerhalb des Arbeitsbereichs."""
+    try:
+        pkg = json.loads((workdir / "package.json").read_text())
+    except (OSError, ValueError):
+        return []
+    found = set()
+    for sect in ("dependencies", "devDependencies", "optionalDependencies", "overrides"):
+        for v in (pkg.get(sect) or {}).values():
+            if isinstance(v, str) and v.startswith("file:"):
+                rel = v[5:][2:] if v[5:].startswith("./") else v[5:]
+                target = (workdir / rel).resolve()
+                if not REL_RE.match(rel) or not str(target).startswith(str(workdir.resolve()) + "/") or not target.exists():
+                    log(out, f"file:-Abhängigkeit außerhalb des Arbeitsbereichs oder fehlend, übergangen: {v}")
+                    continue
+                found.add(rel)
+    return sorted(found)
+
+
+def tree_hash(path: Path) -> str:
+    h = hashlib.sha256()
+    if path.is_file():
+        h.update(path.read_bytes())
+    else:
+        for f in sorted(p for p in path.rglob("*") if p.is_file() and "node_modules" not in p.parts):
+            h.update(str(f.relative_to(path)).encode() + b"\0" + f.read_bytes())
+    return h.hexdigest()
+
+
+def remove_path(p: Path):
+    """Entfernt Datei, Symlink oder Ordner. rmtree allein scheitert still an Symlinks und gesperrten
+    Ordnern; der Rest blockiert danach den APFS-Klon mit „File exists“ (#3999)."""
+    if p.is_symlink() or p.is_file():
+        p.unlink()
+    elif p.is_dir():
+        for d, _dirs, _files in os.walk(p, followlinks=False):  # Schreibrecht zurück, falls ein Test es nahm
+            try:
+                os.chmod(d, 0o700)
+            except OSError:
+                pass
+        shutil.rmtree(p)
+    if p.exists() or p.is_symlink():
+        die(f"{p.name} im Arbeitsbereich lässt sich nicht entfernen")
+
+
+def prepare_node(workdir: Path, out):
+    lock = "package-lock.json" if (workdir / "package-lock.json").is_file() else None
+    if not lock:
+        die("package-lock.json fehlt (npm ci braucht sie)")
+    local = local_file_deps(workdir, out)
+    h = hashlib.sha256(sha_files(workdir, ["package.json", lock]).encode())
+    for rel in local:
+        h.update(b"\0" + rel.encode() + b"\0" + tree_hash(workdir / rel).encode())
+    key = h.hexdigest()[:16]
+    cached = CACHE / "node" / key
+    with Lock(CACHE / "node" / f"{key}.lock"):
+        if not (cached / ".fertig").exists():
+            t0 = time.time()
+            log(out, f"neue node_modules {key} (einmalig je Lockdatei)")
+            shutil.rmtree(cached, ignore_errors=True)
+            cached.mkdir(parents=True)
+            for f in ("package.json", lock):  # nie .npmrc: kann Zugangsdaten tragen
+                shutil.copy2(workdir / f, cached / f)
+            for rel in local:  # lokale file:-Abhängigkeiten (z. B. vendor/*.tgz), relativ wie im Repo
+                src, dst = workdir / rel, cached / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                if src.is_dir():
+                    shutil.copytree(src, dst, ignore=shutil.ignore_patterns("node_modules", ".git"))
+                else:
+                    shutil.copy2(src, dst)
+            rc = subprocess.run(["npm", "ci", "--no-audit", "--no-fund", "--loglevel=error"], cwd=cached,
+                                env={**os.environ, "PATH": BREW_PATH}, stdout=out, stderr=out).returncode
+            if rc != 0:
+                shutil.rmtree(cached, ignore_errors=True)
+                log(out, f"npm ci fehlgeschlagen (rc={rc})")
+                raise SystemExit(rc)
+            (cached / ".fertig").write_text(str(int(time.time())))
+            log(out, f"node_modules fertig in {time.time() - t0:.0f} s")
+    marker = workdir / "node_modules" / ".studio-ci-key"
+    if not (marker.is_file() and marker.read_text() == key):
+        remove_path(workdir / "node_modules")
+        if (cached / "node_modules").is_dir():
+            # APFS-Klon: sofort, belegt keinen Platz, Änderungen im Arbeitsbereich bleiben dort.
+            subprocess.run(["/bin/cp", "-cR", str(cached / "node_modules"), str(workdir / "node_modules")],
+                           check=True)
+        else:  # ohne Abhängigkeiten legt npm ci keinen Ordner an
+            (workdir / "node_modules").mkdir()
+        marker.write_text(key)
+    return {"PATH": f"{workdir}/node_modules/.bin:" + BREW_PATH}
+
+
+def build_git_index(root: Path, out):
+    """Git-Index ohne Verlauf aus .studio-test/tracked, damit `git ls-files` die versionierten Dateien
+    liefert. git log, diff und blame haben hier nichts; das echte .git geht nie mit."""
+    lst = root / ".studio-test" / "tracked"
+    if not lst.is_file() or lst.stat().st_size == 0:
+        return
+    git = first_existing(["/usr/bin/git", "/opt/homebrew/bin/git"])
+    if not git:
+        return
+    rootr = root.resolve()
+    keep = []
+    for raw in lst.read_bytes().split(b"\0"):
+        rel = raw.decode("utf-8", "surrogateescape")
+        if not rel or rel.startswith("/") or ".." in Path(rel).parts:
+            continue
+        if (rootr / rel).is_file() or (rootr / rel).is_symlink():
+            keep.append(raw)
+    # Keine Konfiguration von außen: System, ~/.gitconfig und ~/.config/git (für agentos-ci beschreibbar).
+    env = {"HOME": str(HOME), "PATH": BREW_PATH, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
+           "XDG_CONFIG_HOME": str(CI / "tmp" / "kein-xdg"), "GIT_TERMINAL_PROMPT": "0"}
+    gd = root / ".git"
+    # Je Lauf frisch: Ein Test des vorigen Laufs könnte in .git/config fsmonitor, Filter oder Hooks gesetzt
+    # haben, die der nächste git add sonst ausführt (Hinweis Cloud-Operator).
+    if gd.is_symlink() or gd.is_file():
+        gd.unlink(missing_ok=True)
+    elif gd.is_dir():
+        for d, dirs, _files in os.walk(gd, followlinks=False):  # Schreibrecht zurück, falls ein Test es nahm
+            try:
+                os.chmod(d, 0o700)
+            except OSError:
+                pass
+    shutil.rmtree(gd, ignore_errors=True)
+    if gd.exists() or gd.is_symlink():
+        # Teilweise stehen geblieben (z. B. ein Test hat .git auf 0555 gesetzt): git init würde die alte
+        # config samt Filtern übernehmen. Dann lieber ohne Index (Hinweis Cloud-Operator).
+        log(out, ".git ließ sich nicht vollständig entfernen, Git-Index ausgelassen")
+        return
+    subprocess.run([git, "init", "-q", str(root)], env=env, check=False)
+    pf = gd / "studio-ci-pathspec"
+    pf.write_bytes(b"\0".join(keep))
+    t0 = time.time()
+    rc = subprocess.run([git, "-C", str(root), "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+                         "-c", "core.untrackedCache=false", "add", "-f",
+                         "--pathspec-from-file", str(pf), "--pathspec-file-nul"],
+                        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE).returncode
+    if rc != 0:
+        log(out, f"Git-Index für ls-files nicht gebaut (rc={rc}), Tests mit git können scheitern")
+    else:
+        # Ein einzelner Commit ohne Eltern, damit `git rev-parse HEAD` antwortet. Sein Hash ist nicht der des
+        # Repos; Tests, die Verlauf oder den echten Hash brauchen, gehören nach arkserver.
+        cenv = {**env, "GIT_AUTHOR_NAME": "studio-ci", "GIT_AUTHOR_EMAIL": "studio-ci@localhost",
+                "GIT_COMMITTER_NAME": "studio-ci", "GIT_COMMITTER_EMAIL": "studio-ci@localhost",
+                "GIT_AUTHOR_DATE": "2000-01-01T00:00:00Z", "GIT_COMMITTER_DATE": "2000-01-01T00:00:00Z"}
+        rc = subprocess.run([git, "-C", str(root), "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false",
+                             "commit", "-q", "--no-verify", "--allow-empty", "-m", "studio-ci: Stand ohne Verlauf"],
+                            env=cenv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
+        log(out, f"Git-Index mit {len(keep)} Dateien in {time.time() - t0:.1f} s (ohne Verlauf"
+            + (", HEAD ist ein Ersatz-Commit)" if rc == 0 else ", ohne HEAD)"))
+
+
+def raise_nofile(out):
+    """macOS gibt Prozessen 256 offene Dateien; größere Suiten brechen dann mit Errno 24 ab."""
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    for want in (65536, 24576, 10240, 4096):
+        if want <= soft:
+            return
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (want if hard == resource.RLIM_INFINITY else min(want, hard), hard))
+            return
+        except (ValueError, OSError):
+            continue
+    log(out, f"offene Dateien bleiben bei {soft}")
+
+
+# --------------------------------------------------------------------------- Slots
+
+def take_slot(out, wait_max):
+    t0 = time.time()
+    announced = False
+    while True:
+        for i in range(1, MAX_SLOTS + 1):
+            fh = open(SLOTS / f"{i}.lock", "w")
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fh, i, time.time() - t0
+            except BlockingIOError:
+                fh.close()
+        if time.time() - t0 > wait_max:
+            log(out, f"alle {MAX_SLOTS} Plätze belegt seit {wait_max} s")
+            sys.exit(75)  # EX_TEMPFAIL: der Client fällt auf arkserver zurück
+        if not announced:
+            log(out, f"alle {MAX_SLOTS} Plätze belegt, warte …")
+            announced = True
+        time.sleep(2)
+
+
+# --------------------------------------------------------------------------- Befehle
+
+def cmd_run(args, from_gate):
+    """run <arbeitsbereich> <unterordner|.> <setup> <timeout> <wartezeit> <detach 0|1> [teile=N] -- <befehl…>"""
+    if "--" not in args:
+        die("run: -- fehlt")
+    i = args.index("--")
+    head, command = args[:i], args[i + 1:]
+    teile = 1
+    if len(head) == 7:
+        m = TEILE_RE.match(head.pop())
+        if not m:
+            die("run: teile=1..16")
+        teile = int(m.group(1))
+    if len(head) != 6 or not command:
+        die("run: Argumente")
+    ws, sub, setup, timeout, wait_max, detach = head
+    if not NAME_RE.match(ws) or not REL_RE.match(sub) or setup not in ("python", "node", "none"):
+        die("run: ungültige Angabe")
+    timeout = min(int(timeout), MAX_TIMEOUT)
+    wait_max = min(int(wait_max), 1800)
+    ensure_dirs()
+    root = WS / ws
+    workdir = (root / sub).resolve()
+    if not str(workdir).startswith(str(root.resolve())) or not workdir.is_dir():
+        die(f"run: Ordner {sub} fehlt im Arbeitsbereich")
+    run_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+    meta = {"id": run_id, "ws": ws, "sub": sub, "cmd": command, "teile": teile, "start": time.time(),
+            "status": "läuft"}
+    (RUNS / f"{run_id}.json").write_text(json.dumps(meta))
+    if detach == "1":
+        pid = os.fork()
+        if pid:
+            print(run_id)
+            return 0
+        os.setsid()
+        logf = open(RUNS / f"{run_id}.log", "w", buffering=1)
+        os.dup2(logf.fileno(), 1)
+        os.dup2(logf.fileno(), 2)
+        devnull = os.open(os.devnull, os.O_RDONLY)
+        os.dup2(devnull, 0)
+        out = sys.stdout
+    else:
+        out = Tee(sys.stdout, open(RUNS / f"{run_id}.log", "w", buffering=1))
+    rc = execute(run_id, meta, root, workdir, setup, command, timeout, wait_max, out, teile)
+    if detach == "1":
+        os._exit(rc)
+    return rc
+
+
+class Tee:
+    def __init__(self, *s):
+        self.s = s
+
+    def write(self, d):
+        for x in self.s:
+            x.write(d)
+
+    def flush(self):
+        for x in self.s:
+            x.flush()
+
+    def fileno(self):
+        return self.s[0].fileno()
+
+
+def split_files(root: Path, workdir: Path, teile: int, out):
+    """Testdateien sortiert reihum auf die Teile (wie release.yml #3718: bekannte Reihenfolge bleibt je Teil)."""
+    muster = repo_conf(root).get("TEST_DATEIEN", "tests/test_*.py").split()
+    bad = [m for m in muster if not GLOB_RE.match(m)]
+    if bad or not muster:
+        log(out, f"TEST_DATEIEN: ungültiges Muster {bad[0] if bad else ''!r}")
+        raise SystemExit(2)
+    wr = workdir.resolve()
+    ohne_f = root / ".studio-test" / "ohne"
+    ohne = [x for x in (ohne_f.read_text(errors="replace").split() if ohne_f.is_file() else []) if GLOB_RE.match(x)]
+    files = sorted({str(f.relative_to(workdir)) for m in muster for f in workdir.glob(m)
+                    if f.is_file() and str(f.resolve()).startswith(str(wr) + "/")})
+    if ohne:
+        vorher = len(files)
+        files = [f for f in files if not any(fnmatch.fnmatch(f, o) for o in ohne)]
+        log(out, f"ohne {' '.join(ohne)}: {vorher - len(files)} Dateien ausgelassen")
+    if not files:
+        log(out, f"TEST_DATEIEN: keine Datei für {' '.join(muster)}")
+        raise SystemExit(2)
+    return [files[k::teile] for k in range(teile) if files[k::teile]]
+
+
+def run_parts(run_id, workdir, command, env, run_tmp, parts, timeout, out):
+    """Startet je Teil einen Prozess mit eigenem TMPDIR und Log. rc 0 nur, wenn alle Teile 0 liefern."""
+    t0 = time.time()
+    procs = []
+    for k, files in enumerate(parts, 1):
+        tdir = run_tmp / f"teil{k}"
+        tdir.mkdir(mode=0o700)
+        logf = open(RUNS / f"{run_id}.teil{k}.log", "wb")
+        p = subprocess.Popen(["/usr/bin/nice", "-n", str(NICE)] + command + files, cwd=workdir,
+                             env={**env, "TMPDIR": str(tdir), "STUDIO_TEIL": str(k)}, stdout=logf,
+                             stderr=subprocess.STDOUT, start_new_session=True)
+        procs.append((k, p, logf, len(files)))
+    log(out, f"{len(parts)} Teile gestartet ({sum(n for *_, n in procs)} Dateien)")
+    deadline = t0 + timeout
+    rcs = {}
+    while len(rcs) < len(procs):
+        for k, p, logf, n in procs:
+            if k in rcs or p.poll() is None:
+                continue
+            rcs[k] = p.returncode
+            logf.close()
+            text = (RUNS / f"{run_id}.teil{k}.log").read_text(errors="replace").splitlines()
+            wichtig = [x for x in text if x.startswith(("FAILED", "ERROR"))][:50]
+            log(out, f"Teil {k}/{len(procs)} rc={p.returncode} nach {time.time() - t0:.0f} s ({n} Dateien)")
+            for x in wichtig + text[-1:]:
+                out.write(f"  [{k}] {x}\n")
+            out.flush()
+        if len(rcs) < len(procs) and time.time() > deadline:
+            for k, p, logf, n in procs:
+                if k not in rcs:
+                    for sig in (signal.SIGTERM, signal.SIGKILL):
+                        try:
+                            os.killpg(p.pid, sig)
+                            p.wait(timeout=5)
+                            break
+                        except ProcessLookupError:
+                            break
+                        except subprocess.TimeoutExpired:
+                            continue
+                    rcs[k] = 124
+                    logf.close()
+            log(out, f"Zeitlimit {timeout} s überschritten, abgebrochen")
+            return 124
+        time.sleep(0.5)
+    bad = [rc for rc in rcs.values() if rc != 0]
+    return bad[0] if bad else 0
+
+
+def execute(run_id, meta, root, workdir, setup, command, timeout, wait_max, out, teile=1):
+    slot_fh, slot, waited = take_slot(out, wait_max)
+    rc = 1
+    # Eigenes TMPDIR je Lauf: Parallele Läufe teilen sich sonst z. B. $TMPDIR/daten (cloud-api).
+    run_tmp = CI / "tmp" / run_id
+    try:
+        with Lock(root.parent / f"{root.name}.lock"):
+            log(out, f"Lauf {run_id} · Platz {slot}/{MAX_SLOTS} · wartete {waited:.0f} s")
+            env = {"HOME": str(HOME), "LANG": "en_US.UTF-8", "CI": "1", "STUDIO_CI": "1",
+                   "TMPDIR": str(run_tmp), "PATH": BREW_PATH}
+            run_tmp.mkdir(parents=True, exist_ok=True, mode=0o700)
+            if setup == "python":
+                extra = repo_conf(root).get("TEST_PIP", "").split()
+                bad = [x for x in extra if not PIP_SPEC_RE.match(x)]
+                if bad:
+                    log(out, f"TEST_PIP: ungültige Angabe {bad[0]!r} (nur Paket[extra]==Version)")
+                    raise SystemExit(2)
+                env.update(prepare_python(workdir, ["requirements.lock", "requirements.txt", "requirements-dev.txt",
+                                                    "requirements-test.txt"], out, extra, root=root))
+            elif setup == "node":
+                env.update(prepare_node(workdir, out))
+            build_git_index(root, out)
+            raise_nofile(out)
+            # Eigenes Home je Lauf: Das echte Home gehört root, und Tests sollen ohnehin kein fremdes
+            # Home verändern (cloud-api schreibt nach ~/.cloud-api-bots). Abhängigkeiten sind schon bereit.
+            (run_tmp / "home").mkdir(mode=0o700)
+            env["HOME"] = str(run_tmp / "home")
+            t0 = time.time()
+            if teile > 1:
+                parts = split_files(root, workdir, teile, out)
+                rc = run_parts(run_id, workdir, command, env, run_tmp, parts, timeout, out)
+                log(out, f"Ende rc={rc} nach {time.time() - t0:.1f} s")
+                return rc
+            p = subprocess.Popen(["/usr/bin/nice", "-n", str(NICE)] + command, cwd=workdir, env=env,
+                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+            def pump():
+                for line in iter(p.stdout.readline, b""):
+                    out.write(line.decode("utf-8", "replace"))
+                    out.flush()
+            reader = threading.Thread(target=pump, daemon=True)
+            reader.start()
+            try:
+                rc = p.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                for sig in (signal.SIGTERM, signal.SIGKILL):
+                    try:
+                        os.killpg(p.pid, sig)
+                        p.wait(timeout=5)
+                        break
+                    except ProcessLookupError:
+                        break
+                    except subprocess.TimeoutExpired:
+                        continue
+                log(out, f"Zeitlimit {timeout} s überschritten, abgebrochen")
+                rc = 124
+            reader.join(timeout=5)
+            log(out, f"Ende rc={rc} nach {time.time() - t0:.1f} s")
+    except SystemExit as e:
+        rc = e.code if isinstance(e.code, int) else 1
+    finally:
+        slot_fh.close()
+        shutil.rmtree(run_tmp, ignore_errors=True)
+        meta.update({"status": "fertig", "rc": rc, "ende": time.time()})
+        (RUNS / f"{run_id}.json").write_text(json.dumps(meta))
+    return rc
+
+
+def cmd_status(args):
+    if len(args) != 1 or not RUN_RE.match(args[0]):
+        die("status <lauf-id>")
+    p = RUNS / f"{args[0]}.json"
+    if not p.is_file():
+        die("unbekannter Lauf", 3)
+    print(p.read_text())
+    return 0
+
+
+def cmd_log(args):
+    if len(args) != 1 or not RUN_RE.match(args[0]):
+        die("log <lauf-id>")
+    p = RUNS / f"{args[0]}.log"
+    if not p.is_file():
+        die("kein Log", 3)
+    sys.stdout.write(p.read_text(errors="replace"))
+    for t in sorted(RUNS.glob(f"{args[0]}.teil*.log"), key=lambda x: int(x.name.rsplit("teil", 1)[1][:-4])):
+        sys.stdout.write(f"\n===== {t.name} =====\n" + t.read_text(errors="replace"))
+    return 0
+
+
+def cmd_ping(_args):
+    load = os.getloadavg()[0]
+    busy = 0
+    for i in range(1, MAX_SLOTS + 1):
+        fh = open(SLOTS / f"{i}.lock", "w") if SLOTS.exists() else None
+        if fh is None:
+            break
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fh, fcntl.LOCK_UN)
+        except BlockingIOError:
+            busy += 1
+        fh.close()
+    print(json.dumps({"ok": True, "load": round(load, 2), "slots": MAX_SLOTS, "belegt": busy,
+                      "kerne": os.cpu_count()}))
+    return 0
+
+
+def cmd_aufraeumen(_args):
+    """Läufe älter als 7 Tage, Caches 14 Tage ohne Nutzung, Arbeitsbereiche 14 Tage ohne Sync."""
+    now = time.time()
+    n = 0
+    for p in RUNS.glob("*"):
+        if now - p.stat().st_mtime > 7 * 86400:
+            p.unlink(missing_ok=True)
+            n += 1
+    for base in (CACHE / "venv", CACHE / "node", WS):
+        for d in base.iterdir() if base.exists() else []:
+            if d.is_dir() and now - d.stat().st_atime > 14 * 86400 and now - d.stat().st_mtime > 14 * 86400:
+                shutil.rmtree(d, ignore_errors=True)
+                n += 1
+    print(f"aufgeräumt: {n}")
+    return 0
+
+
+def main(argv, from_gate=False):
+    ensure_dirs()
+    if not argv:
+        die("Befehl fehlt: run|status|log|ping|aufraeumen")
+    cmd, args = argv[0], argv[1:]
+    table = {"run": lambda a: cmd_run(a, from_gate), "status": cmd_status, "log": cmd_log,
+             "ping": cmd_ping, "aufraeumen": cmd_aufraeumen}
+    if cmd == "gate" and not from_gate:
+        return gate()
+    if cmd not in table:
+        die(f"unbekannt: {cmd}")
+    return table[cmd](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]) or 0)
