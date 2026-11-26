@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+"""prod-pakete-sammler - Paketstände der Dienste aus Produktion für studio-test (#4064).
+
+Liest die Zuordnung Dienst -> Rechner, Unit, Verzeichnis aus ``cloud-api/.devops/tenant/kern.json``
+(``hosts`` mit dem ssh-Aufruf je Rechner, ``dienste`` mit ``host`` bzw. ``hosts``, ``unit``, ``dir``).
+Je Dienst und Rechner fragt er per ssh den **laufenden** Prozess der Unit ab: MainPID, daraus das venv
+(argv, VIRTUAL_ENV oder die geladenen site-packages), dann ``Name==Version`` aus ``importlib.metadata``
+dieses venv und die Python-Version. Er schreibt je Dienst ``<ziel>/<repo>.json``. ``<repo>`` ist der
+Basisname von ``origin`` im Dienstverzeichnis, sonst der Dienstname. Das ist der Name, unter dem
+studio-test sucht.
+
+Läuft ein Dienst auf mehreren Rechnern, gilt der älteste Stand (siehe ``aeltester``). Die übrigen
+Rechner stehen mit ihren abweichenden Paketen unter ``abweichung``.
+
+Ein Dienst ohne Python-venv (etwa Node) wird übersprungen. Scheitert die Abfrage, bleibt die alte Datei
+unverändert. Sie veraltet dann, und studio-test fällt nach 48 h zurück bzw. endet mit ``--streng`` mit rc 3.
+Exit-Code 1, wenn mindestens ein Python-Dienst nicht abgefragt werden konnte.
+
+Den Rechner, auf dem er selbst läuft (``--lokal``, Vorgabe der kurze Hostname), fragt er ohne ssh ab:
+root hat dort keinen ssh-Zugang zu sich selbst.
+
+Aufruf (als root auf arkserver, der Rechner mit ssh zu allen Diensten):
+    prod-pakete-sammler [--kern-json PFAD] [--ziel ORDNER] [--nur DIENST ...] [--lokal NAME] [--trocken]
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import re
+import shlex
+import socket
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Callable, Optional
+
+KERN_JSON = Path("/var/www/cloud-api/.devops/tenant/kern.json")
+ZIEL = Path(os.environ.get("STUDIO_PROD_PAKETE", "/var/lib/agentos/prod-pakete"))
+SSH_ZEIT_S = 90
+
+# Dieselben Prüfungen wie studio-test (prod_pakete): nur Zeilen, die dort gelten, kommen in die Datei.
+PIN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,100}==[A-Za-z0-9][A-Za-z0-9.+!_-]{0,60}$")
+PYVER_RE = re.compile(r"^3\.[0-9]{1,2}$")
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
+UNIT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9@._-]{0,120}$")
+DIR_RE = re.compile(r"^/[A-Za-z0-9._/-]{1,300}$")
+
+# Läuft auf dem Zielrechner als ``python3 -I -c`` (argv: unit, dir). Gibt genau eine JSON-Zeile aus.
+FERN = r'''
+import json, os, re, subprocess, sys
+unit, d = sys.argv[1], sys.argv[2]
+def fertig(**k):
+    print(json.dumps(k)); sys.exit(0)
+def show(p):
+    r = subprocess.run(["systemctl", "show", "-p", p, "--value", unit], capture_output=True, text=True)
+    return r.stdout.strip()
+if show("ActiveState") != "active":
+    fertig(fehler="Unit nicht aktiv (%s)" % (show("ActiveState") or "?"))
+pid = show("MainPID")
+if not pid.isdigit() or pid == "0":
+    fertig(fehler="keine MainPID")
+def venv_von(p):
+    if not p or not p.startswith("/"):
+        return None
+    b = os.path.dirname(os.path.abspath(p)); v = os.path.dirname(b)
+    if os.path.basename(b) == "bin" and os.path.isfile(os.path.join(v, "pyvenv.cfg")):
+        return v
+    return None
+argv = [a.decode(errors="replace") for a in open("/proc/%s/cmdline" % pid, "rb").read().split(b"\0") if a]
+venv, wie = None, None
+for a in argv[:3]:
+    venv = venv_von(a)
+    if venv:
+        wie = "argv"; break
+if not venv:
+    env = dict(z.split("=", 1) for z in open("/proc/%s/environ" % pid, "rb").read().decode(errors="replace").split("\0") if "=" in z)
+    ve = env.get("VIRTUAL_ENV", "")
+    if ve and os.path.isfile(os.path.join(ve, "pyvenv.cfg")):
+        venv, wie = ve, "VIRTUAL_ENV"
+if not venv:
+    for z in open("/proc/%s/maps" % pid, errors="replace"):
+        m = re.search(r"(/\S+?)/lib/python3\.\d+/site-packages/", z)
+        if m and os.path.isfile(os.path.join(m.group(1), "pyvenv.cfg")):
+            venv, wie = m.group(1), "maps"; break
+if not venv:
+    exe = os.path.basename(os.path.realpath("/proc/%s/exe" % pid))
+    fertig(kein_python=not exe.startswith("python"), fehler="kein venv am Prozess (%s)" % exe)
+py = os.path.join(venv, "bin", "python")
+LISTE = ("import importlib.metadata as m, json, re, sys\n"
+         "seen = {}\n"
+         "for dist in m.distributions():\n"
+         "    n = dist.metadata['Name']\n"
+         "    if not n: continue\n"
+         "    k = re.sub(r'[-_.]+', '-', n).lower()\n"
+         "    seen.setdefault(k, '%s==%s' % (n, dist.version))\n"
+         "print(json.dumps({'python': '%d.%d' % sys.version_info[:2], 'pakete': sorted(seen.values(), key=str.lower)}))\n")
+r = subprocess.run([py, "-I", "-c", LISTE], capture_output=True, text=True, timeout=60)
+if r.returncode != 0:
+    fertig(fehler="Paketliste aus %s: rc %d" % (venv, r.returncode))
+daten = json.loads(r.stdout.strip().splitlines()[-1])
+repo = ""
+g = subprocess.run(["git", "-c", "safe.directory=*", "-C", d, "remote", "get-url", "origin"], capture_output=True, text=True)
+if g.returncode == 0:
+    repo = re.sub(r"\.git$", "", g.stdout.strip().rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1])
+fertig(venv=venv, wie=wie, pid=int(pid), python=daten["python"], pakete=daten["pakete"], repo=repo)
+'''
+
+
+def version_schluessel(v: str):
+    """Sortierschlüssel für Versionen. packaging, wenn vorhanden, sonst Ziffern- und Buchstabenteile."""
+    try:
+        try:
+            from packaging.version import Version  # type: ignore
+        except ImportError:
+            from pip._vendor.packaging.version import Version  # type: ignore
+        return (0, Version(v))
+    except Exception:
+        teile = re.findall(r"\d+|[A-Za-z]+", v)
+        return (1, tuple((0, int(t)) if t.isdigit() else (-1, t) for t in teile))
+
+
+def _pins(pakete) -> dict:
+    out = {}
+    for p in pakete:
+        n, _, v = p.partition("==")
+        out[re.sub(r"[-_.]+", "-", n).lower()] = (p, v)
+    return out
+
+
+def aeltester(staende: list) -> int:
+    """Index des ältesten Stands. Ein Rechner gilt als älter, wenn seine Python-Version kleiner ist, sonst
+    wenn bei mehr gemeinsamen Paketen seine Version die kleinere ist. Gleichstand: Reihenfolge aus kern.json."""
+    if len(staende) == 1:
+        return 0
+    pins = [_pins(s["pakete"]) for s in staende]
+
+    def punkte(i):
+        kleiner = 0
+        for k, (_, v) in pins[i].items():
+            andere = [pins[j][k][1] for j in range(len(staende)) if j != i and k in pins[j]]
+            if andere and all(version_schluessel(v) < version_schluessel(a) for a in andere):
+                kleiner += 1
+        return kleiner
+
+    return min(range(len(staende)),
+               key=lambda i: (version_schluessel(staende[i]["python"]), -punkte(i), i))
+
+
+def datei_bauen(dienst: str, unit: str, staende: list, jetzt: Optional[datetime] = None) -> dict:
+    """staende: [{host, venv, python, pakete}] (nur gelungene Abfragen). Ergibt den Inhalt von <repo>.json."""
+    jetzt = jetzt or datetime.now(timezone.utc)
+    i = aeltester(staende)
+    basis = staende[i]
+    basis_pins = _pins(basis["pakete"])
+    abweichung = []
+    for j, s in enumerate(staende):
+        if j == i:
+            continue
+        anders = sorted((p for k, (p, v) in _pins(s["pakete"]).items()
+                         if k not in basis_pins or basis_pins[k][1] != v), key=str.lower)
+        if anders or s["python"] != basis["python"]:
+            abweichung.append({"host": s["host"], "venv": s["venv"], "python": s["python"], "anders": anders})
+    return {"dienst": dienst, "stand": jetzt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "quelle": {"host": basis["host"], "unit": unit if unit.endswith(".service") else unit + ".service",
+                       "venv": basis["venv"]},
+            "python": basis["python"], "pakete": basis["pakete"], "abweichung": abweichung}
+
+
+def fern_befehl(ssh: Optional[list], unit: str, verzeichnis: str) -> list:
+    """ssh-Aufruf aus kern.json plus der Abfrage. ssh setzt die Argumente zu einer Zeile für die
+    Gegenseite zusammen, deshalb ist jedes einzeln gequotet; der Code geht als base64 mit.
+    ssh=None: derselbe Aufruf auf diesem Rechner, ohne ssh und ohne Quoting."""
+    code = base64.b64encode(FERN.encode()).decode()
+    boot = f"import base64;exec(base64.b64decode('{code}'))"
+    if ssh is None:
+        return ["python3", "-I", "-c", boot, unit, verzeichnis]
+    return list(ssh) + ["python3", "-I", "-c", shlex.quote(boot), shlex.quote(unit), shlex.quote(verzeichnis)]
+
+
+def abfragen(ssh: Optional[list], unit: str, verzeichnis: str, lauf: Callable = subprocess.run) -> dict:
+    try:
+        r = lauf(fern_befehl(ssh, unit, verzeichnis), capture_output=True, text=True, timeout=SSH_ZEIT_S)
+    except subprocess.TimeoutExpired:
+        return {"fehler": f"ssh nach {SSH_ZEIT_S} s ohne Antwort"}
+    zeilen = [z for z in (r.stdout or "").splitlines() if z.startswith("{")]
+    if not zeilen:
+        return {"fehler": f"ssh rc {r.returncode} ohne Antwort"}
+    try:
+        return json.loads(zeilen[-1])
+    except ValueError:
+        return {"fehler": "Antwort kein JSON"}
+
+
+def schreiben(ziel: Path, name: str, inhalt: dict) -> Path:
+    ziel.mkdir(parents=True, exist_ok=True)
+    os.chmod(ziel, 0o755)
+    f = ziel / f"{name}.json"
+    fd, tmp = tempfile.mkstemp(dir=ziel, prefix=f".{name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as h:
+            json.dump(inhalt, h, indent=1, ensure_ascii=False)
+            h.write("\n")
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, f)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+    return f
+
+
+def sammeln(kern: dict, ziel: Path, nur=(), trocken: bool = False, lauf: Callable = subprocess.run,
+            ausgabe=print, lokal: str = "") -> int:
+    hosts = kern.get("hosts") or {}
+    fehler = 0
+    for dienst, d in (kern.get("dienste") or {}).items():
+        if nur and dienst not in nur:
+            continue
+        unit, verzeichnis = str(d.get("unit", "")), str(d.get("dir", ""))
+        rechner = d.get("hosts") or [d.get("host")]
+        if not (NAME_RE.match(dienst) and UNIT_RE.match(unit) and DIR_RE.match(verzeichnis)) or \
+                not all(isinstance(h, str) and h in hosts for h in rechner):
+            ausgabe(f"{dienst}: Eintrag in kern.json unvollständig, übersprungen")
+            fehler += 1
+            continue
+        staende, repo, kein_python, probleme = [], "", 0, []
+        for h in rechner:
+            a = abfragen(None if h == lokal else hosts[h]["ssh"], unit, verzeichnis, lauf=lauf)
+            if a.get("kein_python"):
+                kein_python += 1
+                continue
+            if a.get("fehler"):
+                probleme.append(f"{h}: {a['fehler']}")
+                continue
+            pakete = [p for p in a.get("pakete") or [] if PIN_RE.match(p)]
+            ausgelassen = len(a.get("pakete") or []) - len(pakete)
+            if not PYVER_RE.match(str(a.get("python", ""))) or not pakete:
+                probleme.append(f"{h}: Antwort unvollständig")
+                continue
+            staende.append({"host": h, "venv": a["venv"], "python": a["python"], "pakete": pakete,
+                            "ausgelassen": ausgelassen})
+            repo = repo or a.get("repo") or ""
+        if kein_python == len(rechner):
+            ausgabe(f"{dienst}: kein Python-Dienst, übersprungen")
+            continue
+        for p in probleme:
+            ausgabe(f"{dienst}: {p}")
+        if not staende:
+            fehler += 1
+            ausgabe(f"{dienst}: kein Stand, alte Datei bleibt")
+            continue
+        name = repo if NAME_RE.match(repo or "") else dienst
+        inhalt = datei_bauen(dienst, unit, staende)
+        q = inhalt["quelle"]
+        zus = sum(s["ausgelassen"] for s in staende)
+        zeile = (f"{dienst} -> {name}.json: {q['host']}:{q['venv']}, Python {inhalt['python']}, "
+                 f"{len(inhalt['pakete'])} Pakete" + (f", {zus} Zeilen ausgelassen" if zus else "")
+                 + (f", Abweichung {', '.join(a['host'] for a in inhalt['abweichung'])}" if inhalt["abweichung"] else ""))
+        if trocken:
+            ausgabe("trocken: " + zeile)
+        else:
+            schreiben(ziel, name, inhalt)
+            ausgabe(zeile)
+        if probleme:
+            fehler += 1
+    return 1 if fehler else 0
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
+    ap.add_argument("--kern-json", type=Path, default=KERN_JSON)
+    ap.add_argument("--ziel", type=Path, default=ZIEL)
+    ap.add_argument("--nur", nargs="*", default=())
+    ap.add_argument("--lokal", default=socket.gethostname().split(".")[0],
+                    help="Name dieses Rechners in kern.json (ohne ssh abgefragt)")
+    ap.add_argument("--trocken", action="store_true", help="nur ausgeben, nichts schreiben")
+    a = ap.parse_args(argv)
+    kern = json.loads(a.kern_json.read_text())
+    return sammeln(kern, a.ziel, nur=set(a.nur), trocken=a.trocken, lokal=a.lokal)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
