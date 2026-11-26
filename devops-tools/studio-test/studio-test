@@ -30,9 +30,14 @@ Konfiguration je Repo in .devops/studio-test.conf (Zeilen KEY=Wert, alles option
     TEST_DATEIEN=tests/test_*.py         welche Dateien verteilt werden (Muster relativ zu TEST_DIR)
     TEST_OHNE=tests/test_x.py …          diese Dateien beim Aufteilen auslassen (Muster)
 
-Abgleich mit Produktion (Python): Gibt es auf arkserver /var/www/<repo>/venv, gehen ihre Python-Version und
-ihre Paketversionen mit. studio baut die Umgebung dann mit denselben Versionen; passen sie nicht zum Stand,
-ohne Vorgabe, mit Hinweis in der Ausgabe.
+Abgleich mit Produktion (Python): Python-Version und Paketversionen der Produktion gehen mit, studio baut die
+Umgebung mit denselben Versionen. Quelle in dieser Reihenfolge (#4064):
+    1. TEST_PROD_VENV bzw. --prod-venv, wenn gesetzt
+    2. /var/lib/agentos/prod-pakete/<repo>.json, vom Sammler aus dem laufenden venv des Dienstes in
+       Produktion (Rechner laut kern.json), mit Rechner, Pfad und Stand
+    3. /var/www/<repo>/venv auf arkserver (Rückfall, steht so in der Ausgabe)
+Passen die Versionen nicht zum Stand, ohne Vorgabe, mit Hinweis. Mit --streng ist eine Datei aus 2., die
+älter als 48 h oder unlesbar ist, ein Fehler (rc 3).
 
 Ohne Konfiguration: requirements.txt → python -m pytest -q, package.json mit "test" → npm test --.
 Nie mitgeschickt: .git, node_modules, .venv/venv, .env*, *.key, *.pem, secrets/, alles aus .gitignore.
@@ -47,6 +52,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
 
 HOST = os.environ.get("STUDIO_TEST_HOST", "studio-ci")
@@ -59,6 +65,11 @@ EXCLUDES = [".git", "node_modules", ".venv", "venv", "__pycache__/", ".pytest_ca
             ".env.*", "*.key", "*.pem", "*.p12", "secrets/", ".secrets/", "*.db", "*.sqlite",
             "*.sqlite3", "dist/", "build/", ".derived-data/", "DerivedData/", ".npmrc", ".pypirc"]
 LOGDIR = Path.home() / ".cache" / "studio-test"
+PROD_PAKETE = Path(os.environ.get("STUDIO_PROD_PAKETE", "/var/lib/agentos/prod-pakete"))
+PROD_PAKETE_MAX_H = 48
+PIN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,100}==[A-Za-z0-9][A-Za-z0-9.+!_-]{0,60}$")
+PYVER_RE = re.compile(r"^3\.[0-9]{1,2}$")
+DIENST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
 FALLBACK_RC = 75
 
 
@@ -169,6 +180,53 @@ def prod_venv(root: Path, conf) -> Path:
     return None
 
 
+class ProdPaketeFehler(Exception):
+    pass
+
+
+def prod_pakete(name: str):
+    """Paketstände des Dienstes aus Produktion (#4064), vom Sammler unter PROD_PAKETE/<repo>.json abgelegt.
+    None, wenn es keine Datei gibt. ProdPaketeFehler, wenn sie unlesbar, unvollständig oder zu alt ist."""
+    if not DIENST_RE.match(name):
+        return None
+    f = PROD_PAKETE / f"{name}.json"
+    if not f.exists():
+        return None
+    try:
+        data = json.loads(f.read_text())
+        quelle = data.get("quelle") or {}
+        py = str(data["python"]).strip()
+        pakete = [str(x).strip() for x in data["pakete"]]
+        stand = str(data["stand"])
+    except Exception as e:
+        raise ProdPaketeFehler(f"{f} unlesbar ({type(e).__name__})")
+    if not PYVER_RE.match(py):
+        raise ProdPaketeFehler(f"{f}: Python {py!r} ungültig")
+    falsch = [x for x in pakete if not PIN_RE.match(x)]
+    if falsch or not pakete:
+        raise ProdPaketeFehler(f"{f}: {len(falsch)} ungültige Paketzeilen" if falsch else f"{f}: keine Pakete")
+    try:
+        t = datetime.fromisoformat(stand.replace("Z", "+00:00"))
+        if t.tzinfo is None:
+            raise ValueError
+        t = t.timestamp()
+    except ValueError:
+        raise ProdPaketeFehler(f"{f}: Stand {stand!r} ungültig (ISO mit Zeitzone)")
+    alter_h = (time.time() - t) / 3600
+    if alter_h > PROD_PAKETE_MAX_H or alter_h < -1:
+        raise ProdPaketeFehler(f"{f}: Stand {stand} ist {alter_h:.0f} h alt (höchstens {PROD_PAKETE_MAX_H} h)")
+    host = re.sub(r"[^A-Za-z0-9._-]", "", str(quelle.get("host", "?")))[:60] or "?"
+    venv = re.sub(r"[^A-Za-z0-9._/-]", "", str(quelle.get("venv", "?")))[:200] or "?"
+    abw = []
+    for a in data.get("abweichung") or []:
+        if isinstance(a, dict):
+            h = re.sub(r"[^A-Za-z0-9._-]", "", str(a.get("host", "?")))[:60]
+            anders = [x for x in (a.get("anders") or []) if isinstance(x, str) and PIN_RE.match(x)]
+            abw.append(f"{h}: {' '.join(anders[:12])}{' …' if len(anders) > 12 else ''}")
+    return {"python": py, "pakete": sorted(set(pakete), key=str.lower), "abweichung": abw,
+            "quelle": f"{host}:{venv}, Stand {stand}"}
+
+
 def abgleich_dir(root: Path, ws: str, conf) -> Path:
     """Erzeugt ~/.cache/studio-test/abgleich/<ws>/.studio-test mit python und constraints.txt."""
     d = LOGDIR / "abgleich" / ws / ".studio-test"
@@ -190,6 +248,23 @@ def abgleich_dir(root: Path, ws: str, conf) -> Path:
     (d / "tracked").write_bytes(tracked)
     if conf["setup"] != "python":
         return d
+    if not conf.get("prod_venv"):  # ausdrücklich gesetzt (Pfad oder "aus") geht vor
+        try:
+            pp = prod_pakete(repo_name(root))
+        except ProdPaketeFehler as e:
+            if conf.get("streng"):
+                say(f"Paketstände aus Produktion: {e}, streng: Abbruch, rc=3")
+                sys.exit(3)
+            say(f"Paketstände aus Produktion: {e}, Rückfall arkserver-venv")
+            pp = None
+            conf["pp_grund"] = "Datei unbrauchbar"
+        if pp:
+            (d / "python").write_text(pp["python"] + "\n")
+            (d / "constraints.txt").write_text("\n".join(pp["pakete"]) + "\n")
+            conf["abgleich"] = f"{pp['quelle']} (Python {pp['python']}, {len(pp['pakete'])} Pakete)"
+            for a in pp["abweichung"]:
+                say(f"Produktion abweichend auf {a}")
+            return d
     v = prod_venv(root, conf)
     if not v:
         return d
@@ -208,7 +283,9 @@ def abgleich_dir(root: Path, ws: str, conf) -> Path:
     if out:
         (d / "python").write_text(out[0].strip() + "\n")
         (d / "constraints.txt").write_text("\n".join(sorted(out[1:], key=str.lower)) + "\n")
-        conf["abgleich"] = f"{v} (Python {out[0].strip()}, {len(out) - 1} Pakete)"
+        rueck = "" if conf.get("prod_venv") else \
+            f", Rückfall arkserver-venv, {conf.get('pp_grund') or 'keine Datei in ' + str(PROD_PAKETE)}"
+        conf["abgleich"] = f"arkserver:{v} (Python {out[0].strip()}, {len(out) - 1} Pakete{rueck})"
     return d
 
 

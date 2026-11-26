@@ -82,9 +82,28 @@ Ohne Datei: `requirements.txt` ergibt Python mit `python -m pytest -q`, eine `pa
 
 ### Abgleich mit Produktion (Python)
 
-Gibt es auf arkserver eine Produktions-venv des Repos (`/var/www/<repo>/venv`, `.venv` oder
-`/var/www/<repo>.arkturian.com/venv`; der Name kommt aus der Adresse von `origin`), schickt
-`studio-test` ihre Python-Version und ihre Paketversionen als `.studio-test/` mit. studio-ci baut die
+`studio-test` schickt Python-Version und Paketversionen der Produktion als `.studio-test/` mit. Quelle,
+in dieser Reihenfolge (#4064):
+
+1. `TEST_PROD_VENV` bzw. `--prod-venv`, wenn gesetzt.
+2. `/var/lib/agentos/prod-pakete/<repo>.json` (Ordner änderbar über `STUDIO_PROD_PAKETE`). Diese Datei
+   schreibt ein Sammler (Cloud-Operator) aus dem **laufenden** venv des Dienstes auf dem Rechner, auf dem er
+   in Produktion läuft; die Zuordnung kommt aus `cloud-api/.devops/tenant/kern.json`. Läuft ein Dienst auf
+   mehreren Rechnern, steht der älteste Stand in `pakete`, die anderen unter `abweichung`.
+   ```json
+   {"dienst": "auth-api", "stand": "2026-11-26T07:30:00Z",
+    "quelle": {"host": "arkturian", "unit": "auth-api.service", "venv": "/var/www/auth-api/.venv"},
+    "python": "3.11", "pakete": ["fastapi==0.136.1", "starlette==1.0.0"],
+    "abweichung": [{"host": "arkserver", "venv": "…", "python": "3.11", "anders": ["fastapi==0.141.1"]}]}
+   ```
+   Die Ausgabe nennt Rechner, Pfad und Stand, jede Abweichung als eigene Zeile.
+3. Rückfall: die venv auf arkserver (`/var/www/<repo>/venv`, `.venv` oder `/var/www/<repo>.arkturian.com/venv`;
+   der Name kommt aus der Adresse von `origin`). Die Ausgabe sagt dann „Rückfall arkserver-venv“.
+
+Ist die Datei aus 2. unlesbar, enthält ungültige Zeilen oder ist älter als 48 h, gilt ohne `--streng`
+der Rückfall mit Hinweis, mit `--streng` endet der Lauf mit rc 3. Fehlt die Datei, ist das kein Fehler.
+
+studio-ci baut die
 Umgebung dann mit derselben Python-Version (falls auf studio vorhanden) und den Versionen als
 `pip -c`-Vorgabe. Braucht der Arbeitsstand neuere Pakete als Produktion, löst pip die Vorgabe nicht
 auf. Dann baut studio-ci ohne Vorgabe und schreibt einen Hinweis in die Ausgabe.
@@ -98,8 +117,8 @@ auf. Dann baut studio-ci ohne Vorgabe und schreibt einen Hinweis in die Ausgabe.
   Version der Produktion, Python wie in Produktion. Geht das nicht, endet der Lauf mit rc 3 statt ohne
   Vorgabe weiterzubauen. Ein Rückfall auf arkserver findet nicht statt: Bei rc 255 oder 75 rechnet der
   Aufrufer selbst mit seiner Umgebung.
-- Liegt die Produktion nicht auf arkserver, gehören die Versionen als `requirements.lock` ins Repo.
-  Das ist ohnehin der gründlichere Weg.
+- Liegt die Produktion nicht auf arkserver und gibt es noch keine Datei aus 2., gehören die Versionen als
+  `requirements.lock` ins Repo. Das ist ohnehin der gründlichere Weg.
 
 ### Testabhängigkeiten
 
